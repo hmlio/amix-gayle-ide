@@ -12,7 +12,7 @@ does this):
 
 --- master.d/kernel.c.orig	2026-09-27 00:00:00.000000000 +0200
 +++ master.d/kernel.c	2026-09-27 00:00:00.000000000 +0200
-@@ -183,11 +183,13 @@
+@@ -186,12 +186,14 @@
  /* Miscellaneous kernel data */
  
  extern void aciaaintr(), jbintr(), a2091intr(), a3091intr(), aenintr();
