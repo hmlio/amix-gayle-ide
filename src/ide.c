@@ -377,6 +377,7 @@ static int		ide_use_intr;	/* attach(): ideintr is in int2_tbl[] and enabled */
 
 /* interrupt-path bookkeeping (kmem-readable) */
 ulong	ide_intr_count, ide_intr_spurious, ide_intr_timeouts;
+ulong	ide_intr_busy;		/* interrupts taken with the drive still BSY */
 ulong	ide_dup_submits;	/* requests re-submitted while active or queued (ignored) */
 ulong	ide_resets;		/* software resets issued after a timeout */
 
@@ -460,7 +461,9 @@ int		st, write;
 	er = TR( IDE_REG_ERROR);
 	u->laststat = st;
 	u->lasterr  = er;
-	if (er & IDE_ER_IDNF)
+	if (!(st & IDE_ST_ERR))			/* DF alone: the ERROR register is stale */
+		ide_setsense( u, SK_HARDWARE, ASC_INTERNAL_FAILURE, 0);
+	else if (er & IDE_ER_IDNF)
 		ide_setsense( u, SK_ILLEGAL, ASC_LBA_OUT_OF_RANGE, 0);
 	else if (er & (IDE_ER_UNC | IDE_ER_BBK | IDE_ER_AMNF))
 		ide_setsense( u, SK_MEDIUM, write ? ASC_WRITE_ERROR : ASC_READ_ERROR, 0);
@@ -801,7 +804,7 @@ int		drive;
 static struct sdcom	*ide_cq[IDE_CQ];
 static uint		ide_cq_head, ide_cq_tail;
 static int		ide_completing;
-ulong			ide_cq_overflow;	/* must stay 0 */
+ulong			ide_cq_overflow;	/* completions delivered nested because the FIFO was full */
 
 static void
 ide_complete( cp)
@@ -813,9 +816,11 @@ struct sdcom	*cp;
 
 	s = sdspl();
 	nt = (ide_cq_tail + 1) & (IDE_CQ - 1);
-	if (nt == ide_cq_head) {
-		ide_cq_overflow++;
+	if (nt == ide_cq_head) {		/* full: deliver now rather than lose it */
+		if (ide_cq_overflow++ == 0)
+			printf( "ide: completion queue full, delivering directly\n");
 		splx( s);
+		(*cp->intr)( cp);
 		return;
 	}
 	ide_cq[ide_cq_tail] = cp;
@@ -1059,8 +1064,10 @@ ideintr()
 		ide_intr_spurious++;
 		return;
 	}
-	if (st & IDE_ST_BSY)			/* not for us yet; the drive will interrupt again */
+	if (st & IDE_ST_BSY) {			/* not for us yet; the drive will interrupt again */
+		ide_intr_busy++;
 		return;
+	}
 	if (st & (IDE_ST_ERR | IDE_ST_DF)) {
 		ide_ataerror( ide_x.u, st, ide_x.write);
 		ide_finish( -1);
@@ -1205,6 +1212,21 @@ struct sdcom	*cp;
 	if (ide_debug > 1)
 		printf( "ide%d: unit %d cdb 0x%x nbyte %d\n", drive, (int)cp->unit, op, cp->nbyte);
 
+	if (cp->cdb[1] & 0xE0) {		/* a LUN other than 0: there is none */
+		if (op == SC_INQUIRY) {		/* SCSI-2 8.2.5.1: qualifier 011b, type 1Fh */
+			if (data && cp->nbyte) {
+				ide_zero( data, cp->nbyte);
+				data[0] = 0x7F;
+			}
+		} else {
+			ide_setsense( u, SK_ILLEGAL, ASC_LUN_NOT_SUPPORTED, 0);
+			cp->status = SC_CHECK;
+		}
+		splx( s);
+		ide_complete( cp);
+		return TRUE;
+	}
+
 	switch (op) {
 	case SC_TUR:
 	case SC_REZERO:
@@ -1225,7 +1247,7 @@ struct sdcom	*cp;
 		nblk = ((ulong)cp->cdb[7] << 8) | cp->cdb[8];
 		if (nblk == 0)
 			break;				/* nothing to verify: GOOD */
-		if (lba + nblk > u->nsectors) {
+		if (lba >= u->nsectors || nblk > u->nsectors - lba) {
 			ide_setsense( u, SK_ILLEGAL, ASC_LBA_OUT_OF_RANGE, 0);
 			cp->status = SC_CHECK;
 			break;
@@ -1343,7 +1365,7 @@ struct sdcom	*cp;
 			if (ide_pagecross_n++ == 0 || ide_debug)
 				printf( "ide: raw request of %d bytes crosses a page boundary\n", cp->nbyte);
 		}
-		if (nblk == 0 || lba + nblk > u->nsectors) {
+		if (nblk == 0 || lba >= u->nsectors || nblk > u->nsectors - lba) {
 			ide_setsense( u, SK_ILLEGAL, ASC_LBA_OUT_OF_RANGE, 0);
 			cp->status = SC_CHECK;
 			break;

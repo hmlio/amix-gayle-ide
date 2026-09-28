@@ -34,6 +34,7 @@ struct mock_drive {
 	char		model[41];
 	unsigned char	*disk;		/* nsectors * 512 */
 	long		unc_lba;	/* -1, or LBA that fails with UNC */
+	long		df_lba;		/* -1, or LBA that fails with DF set and ERR clear */
 	int		stuck_bsy;	/* status always BSY, even after SRST */
 	int		hung;		/* status BSY, no INTRQ, until a software reset */
 	int		hang_on_cmd;	/* accept the next READ/WRITE, then go `hung' */

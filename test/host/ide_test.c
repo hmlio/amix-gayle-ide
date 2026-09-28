@@ -25,7 +25,7 @@ extern void	idereset();
 extern void	ideintr();
 extern unsigned long	ide_spins, ide_spins_reset, ide_spins_short, ide_cq_overflow;
 extern unsigned long	ide_intr_count, ide_intr_spurious, ide_intr_timeouts, ide_timeout_secs;
-extern unsigned long	ide_dup_submits, ide_resets, ide_pagecross_n;
+extern unsigned long	ide_dup_submits, ide_resets, ide_pagecross_n, ide_intr_busy;
 extern int	ide_slave_enable, ide_debug, ide_master_unit, ide_slave_unit;
 extern int	ide_intr_enable, ide_board_force;
 
@@ -764,6 +764,89 @@ test_sync_cache()
 	CHECK( mock_cmd_count[0xE7] == 0, "no FLUSH CACHE on a drive that lacks it");
 }
 
+/* the small correctness fixes: DF without ERR, LBA wrap, LUN, FIFO overflow */
+static int	flood_calls;
+static struct sdcom	flood[40];
+
+static void
+flood_done( cp)
+struct sdcom	*cp;
+{
+	int	i;
+
+	flood_calls++;
+	if (cp == &flood[0])			/* from inside one completion, submit 39 more */
+		for (i = 1; i < 40; ++i) {
+			memset( &flood[i], 0, sizeof flood[i]);
+			flood[i].unit = 6; flood[i].intr = flood_done;	/* TEST UNIT READY */
+			idequeue( 0, &flood[i]);
+		}
+}
+
+static void
+test_small_fixes()
+{
+	struct sdcom	cp;
+	unsigned char	sense[18];
+	unsigned char	inq[36];
+	unsigned char	cdb[10];
+	static char	buf[512];
+
+	/* DF alone: HARDWARE ERROR / internal failure, whatever the stale ERROR register says */
+	fresh( 1);
+	tur( &cp, 6);
+	mock_drv[0].unc_lba = 10;
+	read10( &cp, 6, 10L, 1, buf, 512);		/* leaves ERROR = UNC */
+	CHECK( cp.okay && cp.status == 0x02, "UNC first: CHECK");
+	reqsense( &cp, 6, sense);
+	mock_drv[0].unc_lba = -1;
+	mock_drv[0].df_lba = 11;
+	read10( &cp, 6, 11L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0x02, "DF without ERR: CHECK");
+	reqsense( &cp, 6, sense);
+	CHECK( sense[2] == 0x04 && sense[12] == 0x44, "DF without ERR: HARDWARE ERROR / internal failure, not the stale UNC");
+	mock_drv[0].df_lba = -1;
+
+	/* LBA + count must not wrap past the end */
+	read10( &cp, 6, 0xFFFFFFF0L, 32, buf, 512);
+	CHECK( cp.okay && cp.status == 0x02 && mock_cmd_count[0x20] == 2, "LBA near 2^32 + count: rejected before the drive");
+	reqsense( &cp, 6, sense);
+	CHECK( sense[2] == 0x05 && sense[12] == 0x21, "LBA wrap: ILLEGAL REQUEST / LBA out of range");
+	read10( &cp, 6, 4095L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 4095L, buf, 512), "last sector still readable");
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x2F; cdb[2] = 0xFF; cdb[3] = 0xFF; cdb[4] = 0xFF; cdb[5] = 0xF0; cdb[8] = 32;
+	run( &cp, 6, cdb, 10, 0, 0);
+	CHECK( cp.okay && cp.status == 0x02 && mock_cmd_count[0x40] == 0, "VERIFY LBA wrap: rejected before the drive");
+
+	/* a LUN other than 0 */
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x28; cdb[1] = 0x20; cdb[5] = 10; cdb[8] = 1;
+	run( &cp, 6, cdb, 10, buf, 512);
+	CHECK( cp.okay && cp.status == 0x02, "READ to LUN 1: CHECK");
+	reqsense( &cp, 6, sense);
+	CHECK( sense[2] == 0x05 && sense[12] == 0x25, "READ to LUN 1: ILLEGAL REQUEST / LUN not supported");
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x12; cdb[1] = 0x20; cdb[4] = 36;
+	memset( inq, 0xEE, sizeof inq);
+	run( &cp, 6, cdb, 6, (char *)inq, 36);
+	CHECK( cp.okay && cp.status == 0 && inq[0] == 0x7F && inq[8] == 0, "INQUIRY to LUN 1: GOOD, qualifier 011b / type 1Fh, no vendor text");
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x12; cdb[4] = 36;
+	run( &cp, 6, cdb, 6, (char *)inq, 36);
+	CHECK( cp.okay && cp.status == 0 && inq[0] == 0x00, "INQUIRY to LUN 0: direct-access device");
+
+	/* completion FIFO full: nothing is lost, delivered nested instead */
+	flood_calls = 0;
+	memset( &flood[0], 0, sizeof flood[0]);
+	flood[0].unit = 6; flood[0].intr = flood_done;
+	idequeue( 0, &flood[0]);
+	CHECK( flood_calls == 40, "40 synchronous completions from inside one callback: all delivered");
+	CHECK( ide_cq_overflow > 0, "FIFO overflow counted");
+	CHECK( strstr( mock_console, "completion queue full") != 0, "FIFO overflow logged");
+	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after the flood");
+	tur( &cp, 6);
+	CHECK( cp.okay && cp.status == 0, "driver usable after the flood");
+	CHECK( ide_intr_busy == 0, "no BSY interrupts seen in these cases");
+	ide_cq_overflow = 0;				/* the flood was deliberate; the global check stays strict */
+}
+
 /* a raw request (<= one page) that straddles a page boundary is counted */
 static void
 test_pagecross_counter()
@@ -1146,6 +1229,7 @@ main()
 	fprintf( stderr, "== test_sync_cache\n"); test_sync_cache();
 	fprintf( stderr, "== test_sync_cache_queued\n"); test_sync_cache_queued();
 	fprintf( stderr, "== test_verify\n"); test_verify();
+	fprintf( stderr, "== test_small_fixes\n"); test_small_fixes();
 	fprintf( stderr, "== test_pagecross_counter\n"); test_pagecross_counter();
 	fprintf( stderr, "== test_read6\n"); test_read6();
 	fprintf( stderr, "== test_queue_order\n"); test_queue_order();

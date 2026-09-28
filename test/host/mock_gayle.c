@@ -124,7 +124,7 @@ const char	*model;
 	d->present  = 1;
 	d->nsectors = nsectors;
 	d->flush    = flush;
-	d->unc_lba  = -1;
+	d->unc_lba  = -1; d->df_lba  = -1;
 	strncpy( d->model, model, 40);
 	d->disk = malloc( nsectors * MOCK_SECTOR);
 	for (i = 0; i < nsectors * MOCK_SECTOR; ++i)	/* recognisable pattern */
@@ -233,6 +233,12 @@ load_sector()
 
 	if (d->unc_lba >= 0 && (unsigned long)d->unc_lba == xlba) {
 		fail( ER_UNC);
+		return;
+	}
+	if (d->df_lba >= 0 && (unsigned long)d->df_lba == xlba) {	/* device fault: ERROR register stale */
+		r_status[sel] = ST_DRDY | ST_DSC | ST_DF;
+		xmode = 0;
+		raise_intrq();
 		return;
 	}
 	memcpy( xbuf, d->disk + xlba * MOCK_SECTOR, MOCK_SECTOR);
