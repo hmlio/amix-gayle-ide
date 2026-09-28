@@ -54,8 +54,8 @@ login works. To my knowledge the first Amix boot on an A4000 with root on IDE.
 
 The IDE master is presented as **SCSI unit 6** (`ide_master_unit`) so that the stock root configuration
 `c6d0s1`, `/etc/vfstab` and the installer's assumptions of an A3000-installed system apply unchanged.
-`support.c.patch` removes the stock kernel's phantom A3000 SCSI controller on AGA machines, which makes
-the IDE port **card 0**.
+`amix-a4091`'s `support.c.patch` (applied by the build hub to every kernel) removes the stock kernel's
+phantom A3000 SCSI controller on AGA machines, which makes the IDE port **card 0**.
 
 ## Layout
 
@@ -64,9 +64,8 @@ driver.conf               0xFFFF1DE0 idequeue "A4000 IDE" ide.c probe=idepresent
 src/ide.c                 the driver: register map, board table, probe, SCSI→ATA translation,
                           level-2 handler (K&R C, single file as amix-kerntools expects)
 src/kernel-patches/       kernel.c.patch  -- ideintr into int2_tbl[] (master.d/kernel.c)
-                          support.c.patch -- phantom A3000 SCSI removal (amiga/kernel/support.c),
-                                             derived from amix-a4091, AGA gate corrected
-                          NOTICE          -- diffs only, not Amix source
+                          NOTICE          -- diffs only, not Amix source; the support.c patch
+                                             (phantom A3000 SCSI removal) comes from amix-a4091
 test/host/                host harness: mock Gayle/ATA, kernel stubs, tests (make check)
 docs/                     decision record, VPOSR AGA-gate finding
 CHANGELOG.md
@@ -86,9 +85,9 @@ Amiberry/WinUAE profile), the single entry point is:
 ```
 
 The harness splices `src/ide.c` into `/usr/sys/amiga/alien/`, generates the controller rows from
-`driver.conf`, applies the two kernel patches with `patch -N`, relinks and clean-gates the kernel.
-When combining with `amix-a4091` in one kernel, apply only **one** of the two `support.c` patches
-(ours differs from upstream's only in the AGA test; see `docs/vposr-aga-gate.md`).
+`driver.conf`, applies `kernel.c.patch` together with `amix-a4091`'s `support.c.patch` (the hub
+applies that one to every kernel; its AGA gate is the low-nibble test from `docs/vposr-aga-gate.md`),
+relinks and clean-gates the kernel.
 
 On an A4000 the resulting kernel boots straight from the CF card: Kickstart 3.1 autoboots the
 `UNIX_Boot` partition of the IDE disk, and the kernel mounts root over this driver. No SCSI card,
@@ -118,10 +117,9 @@ The original work in this repo is released under the **MIT license** (see [`LICE
 [`src/ide.c`](src/ide.c), [`driver.conf`](driver.conf), the test harness and this repository's
 documentation.
 
-The patches in [`src/kernel-patches/`](src/kernel-patches/) are unified diffs against stock Amix
-files: the added lines are MIT, the few quoted stock context lines remain under the original
-Commodore SVR4 copyright. `support.c.patch` is derived from `amix-a4091` (MIT, Jussi Alanärä). See
-[`src/kernel-patches/NOTICE`](src/kernel-patches/NOTICE).
+The patch in [`src/kernel-patches/`](src/kernel-patches/) is a unified diff against a stock Amix
+file: the added lines are MIT, the few quoted stock context lines remain under the original
+Commodore SVR4 copyright. See [`src/kernel-patches/NOTICE`](src/kernel-patches/NOTICE).
 
 Amix itself (SVR4.0), its disk images, Kickstart ROMs and manuals are proprietary Commodore software
 and are **not** included — you need your own Amix 2.1 system. Nothing from Commodore/AT&T or from
