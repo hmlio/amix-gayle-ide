@@ -25,6 +25,7 @@ extern void	idereset();
 extern void	ideintr();
 extern unsigned long	ide_spins, ide_spins_reset, ide_spins_short, ide_cq_overflow;
 extern unsigned long	ide_intr_count, ide_intr_spurious, ide_intr_timeouts, ide_timeout_secs;
+extern unsigned long	ide_dup_submits;
 extern int	ide_slave_enable, ide_debug, ide_master_unit, ide_slave_unit;
 extern int	ide_intr_enable, ide_board_force;
 
@@ -737,6 +738,79 @@ test_queue_order()
 	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after queue drain");
 }
 
+/*
+ * dd.c's completion order (iodone before the trailing startio) can submit
+ * the disk's one sdcom a second time while the first submission is still on
+ * the cable or queued.  The duplicate must be ignored, not linked in again.
+ */
+static struct sdcom	persist;
+static char		persistbuf[2][1024];
+
+static void
+persist_done( cp)
+struct sdcom	*cp;
+{
+	intr_calls++;
+	intr_last = cp;
+}
+
+static void
+test_persistent_sdcom_resubmit()
+{
+	struct sdcom	other;
+	static char	obuf[512];
+	int		i;
+
+	fresh( 1);
+	{ struct sdcom cp; tur( &cp, 6); }
+	intr_calls = 0; ide_dup_submits = 0;
+
+	/* 1. active: the same sdcom submitted again while its READ is on the cable */
+	memset( &persist, 0, sizeof persist);
+	persist.cdb[0] = 0x28; persist.cdb[5] = 60; persist.cdb[8] = 2;
+	persist.addr = persistbuf[0]; persist.nbyte = 1024; persist.unit = 6; persist.intr = persist_done;
+	idequeue( 0, &persist);
+	idequeue( 0, &persist);				/* duplicate while active */
+	CHECK( ide_dup_submits == 1, "resubmit while active: counted");
+	CHECK( intr_calls == 0, "resubmit while active: no completion yet");
+	pump();
+	CHECK( intr_calls == 1, "resubmit while active: completed exactly once");
+	CHECK( persist.okay && persist.status == 0 && disk_equals( 0, 60L, persistbuf[0], 1024),
+	       "resubmit while active: data intact");
+
+	/* 2. queued: behind another request, submitted twice before anything runs */
+	intr_calls = 0; ide_dup_submits = 0;
+	memset( &other, 0, sizeof other);
+	other.cdb[0] = 0x28; other.cdb[5] = 70; other.cdb[8] = 1;
+	other.addr = obuf; other.nbyte = 512; other.unit = 6; other.intr = persist_done;
+	memset( &persist, 0, sizeof persist);
+	persist.cdb[0] = 0x2A; persist.cdb[5] = 72; persist.cdb[8] = 2;	/* a WRITE: replaying it would be worst */
+	persist.addr = persistbuf[1]; persist.nbyte = 1024; persist.unit = 6; persist.intr = persist_done;
+	memset( persistbuf[1], 0x5A, 1024);
+	idequeue( 0, &other);
+	idequeue( 0, &persist);
+	idequeue( 0, &persist);				/* duplicate while queued */
+	idequeue( 0, &persist);				/* and again */
+	CHECK( ide_dup_submits == 2, "resubmit while queued: counted");
+	pump();
+	CHECK( intr_calls == 2, "resubmit while queued: both requests completed once each");
+	CHECK( persist.okay && persist.status == 0 && disk_equals( 0, 72L, persistbuf[1], 1024),
+	       "resubmit while queued: write landed once");
+	CHECK( mock_cmd_count[0x30] == 1, "resubmit while queued: WRITE issued to the drive once");
+	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after resubmits");
+
+	/* 3. after completion the same sdcom is a new request and must be honoured */
+	intr_calls = 0; ide_dup_submits = 0;
+	for (i = 0; i < 3; ++i) {
+		persist.cdb[0] = 0x28; persist.cdb[5] = (unsigned char)(80 + i); persist.cdb[8] = 1;
+		persist.addr = persistbuf[0]; persist.nbyte = 512; persist.intr = persist_done;
+		idequeue( 0, &persist);
+		pump();
+	}
+	CHECK( intr_calls == 3 && ide_dup_submits == 0, "sequential reuse of one sdcom: three completions, no dup");
+	CHECK( disk_equals( 0, 82L, persistbuf[0], 512), "sequential reuse: last read correct");
+}
+
 /* re-entrancy: dd.c starts the next request from inside the completion */
 static struct sdcom	chain[4];
 static char		chainbuf[4][512];
@@ -826,6 +900,7 @@ main()
 	fprintf( stderr, "== test_sync_cache\n"); test_sync_cache();
 	fprintf( stderr, "== test_read6\n"); test_read6();
 	fprintf( stderr, "== test_queue_order\n"); test_queue_order();
+	fprintf( stderr, "== test_persistent_sdcom_resubmit\n"); test_persistent_sdcom_resubmit();
 	fprintf( stderr, "== test_reentrant_completion\n"); test_reentrant_completion();
 	fprintf( stderr, "== test_intr_not_mine\n"); test_intr_not_mine();
 	mock_free();

@@ -365,6 +365,7 @@ static int		ide_use_intr;	/* attach(): ideintr is in int2_tbl[] and enabled */
 
 /* interrupt-path bookkeeping (kmem-readable) */
 ulong	ide_intr_count, ide_intr_spurious, ide_intr_timeouts;
+ulong	ide_dup_submits;	/* requests re-submitted while active or queued (ignored) */
 
 /* --------------------------------------------------- low-level helpers */
 
@@ -778,6 +779,25 @@ static void	ide_start();
 static void	ide_watchdog();
 int		idepresent();
 
+/* Is cp on the cable or waiting for it?  (dd.c can hand us the same sdcom
+ * twice: its completion routine calls iodone() before it starts the next
+ * buffer, and iodone's callback may resubmit the disk's single sdcom while
+ * the first submission is still in flight.  Linking it again would make the
+ * queue eat its own tail.) */
+static int
+ide_pending( cp)
+struct sdcom	*cp;
+{
+	struct sdcom	*p;
+
+	if (cp == ide_active)
+		return 1;
+	for (p = ide_qhead; p; p = (struct sdcom *)p->next)
+		if (p == cp)
+			return 1;
+	return 0;
+}
+
 static void
 ide_enqueue( cp)
 struct sdcom	*cp;
@@ -1036,6 +1056,13 @@ struct sdcom	*cp;
 	int		drive, write, s, i;
 
 	s = sdspl();
+	if (ide_pending( cp)) {			/* already in flight: it completes once, later */
+		ide_dup_submits++;
+		if (ide_debug)
+			printf( "ide: request re-submitted while in flight, ignored\n");
+		splx( s);
+		return TRUE;
+	}
 	if (ide_state == 0) {			/* sd.c probes first; be robust anyway */
 		char	*pa;
 		(void) idepresent( &pa);

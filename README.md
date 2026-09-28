@@ -110,6 +110,12 @@ make -C test/host check      # 439 checks, exit 0 == all pass
   copied as is and only IDENTIFY words are byte-swapped — confirmed on the real machine.
 - The clock is a level-2 interrupt and `sdspl == spl2`, so `lbolt` is frozen inside the queue routine:
   polled waits are bounded spin counts, the interrupt path uses a `timeout()` watchdog.
+- The stock disk driver `dd.c` completes a buffer (`iodone`) before it starts the next one, and the
+  completion callback can resubmit the disk's single `sdcom` while the first submission is still on
+  the cable or queued. `idequeue()` ignores such a duplicate (`ide_dup_submits` counts them); the
+  request completes once, from its first submission. The amigaux.org build hub additionally applies
+  `amix-z3660scsi`'s `dd.c` ordering patch (start the next buffer, then `iodone`) to its IDE kernels;
+  on a stock `dd.c` the guard alone keeps the queue sane.
 
 ## License
 
