@@ -84,7 +84,7 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
  * Kernel virtual == physical for these ranges (sys/immu.h: phystokv(p) == p;
  * the low 1 GB is identity mapped through the 030 transparent translation
  * registers), so the driver dereferences plain addresses.  Cache inhibition
- * of the ranges is a [verify] item (driver/CLAUDE.md, STATUS.md).
+ * of the ranges is a [verify] item (real-hardware check pending).
  */
 /* Base addresses live in the board table (struct ideboard) -- never here. */
 #define IDE_SPAN	0x101BL		/* bytes from a task-file base to the last register + 1 */

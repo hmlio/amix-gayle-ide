@@ -2,7 +2,7 @@
 
 ## 2026-09-28
 
-- **First release** (private repo, shared with the amigaux.org maintainers). License decided: MIT (`LICENSE`). Repository shaped after the
+- **First release.** License: MIT (`LICENSE`). Repository shaped after the
   amix-kerntools driver-author contract (`driver.conf`, `src/`, `src/kernel-patches/` + `NOTICE`,
   `docs/`, `test/host/`).
 
