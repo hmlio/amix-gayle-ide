@@ -34,7 +34,9 @@ struct mock_drive {
 	char		model[41];
 	unsigned char	*disk;		/* nsectors * 512 */
 	long		unc_lba;	/* -1, or LBA that fails with UNC */
-	int		stuck_bsy;	/* status always BSY */
+	int		stuck_bsy;	/* status always BSY, even after SRST */
+	int		hung;		/* status BSY, no INTRQ, until a software reset */
+	int		hang_on_cmd;	/* accept the next READ/WRITE, then go `hung' */
 	int		mute_intrq;	/* never assert INTRQ (interrupt lost) */
 };
 
@@ -56,6 +58,7 @@ extern int			mock_irq_latch;		/* A1200/A600 INTREQ bit 7 */
 extern unsigned char		mock_intena;		/* A1200/A600 INTENA register */
 extern unsigned long		mock_irq_acks;		/* acknowledge writes seen */
 extern unsigned long		mock_id_reads;		/* Gayle ID register reads */
+extern unsigned long		mock_srst_count;	/* software resets seen (SRST set) */
 
 void mock_reset();
 void mock_add_drive();			/* (unit, nsectors, model, flush) */

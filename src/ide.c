@@ -366,6 +366,7 @@ static int		ide_use_intr;	/* attach(): ideintr is in int2_tbl[] and enabled */
 /* interrupt-path bookkeeping (kmem-readable) */
 ulong	ide_intr_count, ide_intr_spurious, ide_intr_timeouts;
 ulong	ide_dup_submits;	/* requests re-submitted while active or queued (ignored) */
+ulong	ide_resets;		/* software resets issued after a timeout */
 
 /* --------------------------------------------------- low-level helpers */
 
@@ -605,6 +606,35 @@ ide_attach()
 	printf( "ide: %s, %s I/O\n", ide_bd->name, ide_use_intr ? "interrupt" : "polled");
 }
 
+/*
+ * Software reset of the cable after a command timed out.  The drive may
+ * still be executing the abandoned command and would otherwise complete it
+ * -- interrupt, data and all -- into whatever request comes next.  SRST
+ * (held for well over the 5 us ATA-2 asks) aborts it on both drives; then
+ * BSY is waited out (bounded), STATUS is read to drop a pending INTRQ, the
+ * Gayle latch is acknowledged where there is one, and interrupt enable is
+ * restored to the attach-time setting.  No SET FEATURES state is lost: the
+ * driver sets none.
+ */
+static void
+ide_reset_drive()
+{
+	int	i, st;
+
+	ide_resets++;
+	TW( IDE_REG_CONTROL, IDE_CTL_SRST | IDE_CTL_NIEN);
+	for (i = 0; i < 16; ++i)
+		(void) TR( IDE_REG_ALTSTAT);
+	TW( IDE_REG_CONTROL, IDE_CTL_NIEN);
+	ide_settle();
+	st = ide_wait( IDE_ST_BSY, 0, ide_spins_reset);
+	(void) TR( IDE_REG_STATUS);
+	ide_irq_ack( ide_bd);
+	TW( IDE_REG_CONTROL, ide_use_intr ? 0 : IDE_CTL_NIEN);
+	if (ide_debug)
+		printf( "ide: drive reset after timeout, status 0x%x\n", st);
+}
+
 /* --------------------------------------------------------- polled I/O */
 
 /* Program the task file for `n' sectors at `lba' and issue the command. */
@@ -655,6 +685,7 @@ ulong		nbyte;
 					ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
 					if (ide_debug)
 						printf( "ide%d: timeout, status 0x%x\n", drive, u->laststat);
+					ide_reset_drive();
 				} else
 					ide_ataerror( u, st, write);
 				return -1;
@@ -670,9 +701,10 @@ ulong		nbyte;
 		}
 		st = ide_wait( IDE_ST_BSY, 0, ide_spins);
 		if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
-			if (st < 0)
+			if (st < 0) {
 				ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
-			else
+				ide_reset_drive();
+			} else
 				ide_ataerror( u, st, write);
 			return -1;
 		}
@@ -699,8 +731,10 @@ int		drive;
 	if (st < 0 || (st & IDE_ST_ERR)) {
 		if (st >= 0)
 			ide_ataerror( u, st, 1);
-		else
+		else {
+			ide_reset_drive();
 			ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+		}
 		return -1;
 	}
 	return 0;
@@ -772,12 +806,14 @@ static struct {
 	ulong		cmdleft;	/* sectors still to move in the current ATA command */
 	uchar		*data;
 	ulong		nbyte, done;
+	ulong		gen;		/* bumped per started request: the watchdog counts ticks per gen */
 } ide_x;
 static int	ide_watch_armed;
-static ulong	ide_watch_ticks;
+static ulong	ide_watch_ticks, ide_watch_gen;
 
 static void	ide_start();
 static void	ide_watchdog();
+static void	ide_reset_drive();
 int		idepresent();
 
 /* Is cp on the cable or waiting for it?  (dd.c can hand us the same sdcom
@@ -921,7 +957,7 @@ ide_start()
 	if (cp == 0)
 		return;
 	ide_active = cp;
-	ide_watch_ticks = 0;
+	ide_x.gen++;
 	/* the transfer description is rebuilt from the CDB, so queued requests
 	 * need no side storage beyond cp->next */
 	ide_x.write = (cp->cdb[0] == SC_WRITE10 || cp->cdb[0] == SC_WRITE6);
@@ -1015,11 +1051,16 @@ ide_watchdog()
 
 	s = sdspl();
 	if (ide_active) {
+		if (ide_watch_gen != ide_x.gen) {	/* a new request since the last tick */
+			ide_watch_gen = ide_x.gen;
+			ide_watch_ticks = 0;
+		}
 		if (++ide_watch_ticks > ide_timeout_secs) {
 			ide_intr_timeouts++;
 			ide_x.u->laststat = TR( IDE_REG_STATUS);
 			printf( "ide%d: command timed out (status 0x%x)\n", ide_x.drive, ide_x.u->laststat);
 			ide_setsense( ide_x.u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+			ide_reset_drive();		/* quiet cable before the next request starts */
 			ide_finish( -1);
 		}
 	}

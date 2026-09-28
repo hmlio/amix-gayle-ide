@@ -25,7 +25,7 @@ extern void	idereset();
 extern void	ideintr();
 extern unsigned long	ide_spins, ide_spins_reset, ide_spins_short, ide_cq_overflow;
 extern unsigned long	ide_intr_count, ide_intr_spurious, ide_intr_timeouts, ide_timeout_secs;
-extern unsigned long	ide_dup_submits;
+extern unsigned long	ide_dup_submits, ide_resets;
 extern int	ide_slave_enable, ide_debug, ide_master_unit, ide_slave_unit;
 extern int	ide_intr_enable, ide_board_force;
 
@@ -74,6 +74,7 @@ int	unit_count;
 	ide_spins_reset = 200000;
 	ide_spins_short = 20000;
 	ide_intr_count = ide_intr_spurious = ide_intr_timeouts = 0;
+	ide_dup_submits = ide_resets = 0;
 	if (unit_count >= 1)
 		mock_add_drive( 0, 4096L, "MOCK CF CARD 2GB", 1);
 	if (unit_count >= 2)
@@ -656,6 +657,83 @@ test_watchdog()
 	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after watchdog");
 }
 
+/*
+ * A drive that hangs mid-command is reset (SRST) when the watchdog gives up,
+ * so the abandoned command cannot complete into the next request; a stale
+ * interrupt afterwards is discarded; a drive that stays busy even after the
+ * reset fails every request without hanging.
+ */
+static void
+test_timeout_recovery()
+{
+	struct sdcom	cp;
+	static char	buf[512];
+	unsigned char	sense[18];
+
+	fresh( 1);
+	tur( &cp, 6);
+	CHECK( mock_nien == 0, "interrupt mode: drive interrupts enabled");
+	mock_drv[0].hang_on_cmd = 1;
+	ide_timeout_secs = 0;
+	memset( &cp, 0, sizeof cp);
+	cp.cdb[0] = 0x28; cp.cdb[5] = 100; cp.cdb[8] = 1;
+	cp.addr = buf; cp.nbyte = 512; cp.unit = 6; cp.intr = done;
+	intr_calls = 0;
+	idequeue( 0, &cp);
+	pump();
+	CHECK( intr_calls == 0 && mock_drv[0].hung == 1, "hung drive: command accepted, then nothing completes");
+	mock_fire_timeouts();
+	CHECK( intr_calls == 1 && cp.okay && cp.status == 0x02, "hung drive: watchdog failed the request");
+	CHECK( ide_intr_timeouts == 1 && ide_resets == 1, "hung drive: timeout and reset counted");
+	CHECK( mock_srst_count == 1, "hung drive: SRST reached the drive");
+	CHECK( mock_drv[0].hung == 0, "hung drive: the reset un-hung it");
+	CHECK( mock_intrq == 0, "after reset: no INTRQ pending");
+	CHECK( mock_nien == 0, "after reset: interrupts re-enabled at the drive");
+	CHECK( mock_timeouts_pending() == 0, "after reset: watchdog disarmed");
+	reqsense( &cp, 6, sense);
+	CHECK( sense[2] == 0x04 && sense[12] == 0x08, "after reset: HARDWARE ERROR / LU communication failure");
+	read10( &cp, 6, 101L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 101L, buf, 512), "next request on the reset drive: GOOD, right data");
+
+	/* a stale interrupt with nothing active is discarded */
+	intr_calls = 0;
+	mock_intrq = 1;
+	pump();
+	CHECK( intr_calls == 0 && ide_intr_spurious == 1, "stale INTRQ, no request active: counted as spurious, nothing completed");
+	read10( &cp, 6, 102L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 102L, buf, 512), "request after the stale interrupt: GOOD");
+
+	/* a drive that stays busy through the reset: every request fails, nothing hangs */
+	mock_drv[0].stuck_bsy = 1;
+	ide_spins = 1000;
+	memset( &cp, 0, sizeof cp);
+	cp.cdb[0] = 0x28; cp.cdb[5] = 103; cp.cdb[8] = 1;
+	cp.addr = buf; cp.nbyte = 512; cp.unit = 6; cp.intr = done;
+	intr_calls = 0;
+	idequeue( 0, &cp);
+	CHECK( intr_calls == 1 && cp.okay && cp.status == 0x02, "stuck after reset: request fails at once (NOT READY), no hang");
+	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after stuck drive");
+	mock_drv[0].stuck_bsy = 0;
+	ide_spins = 200000;
+	read10( &cp, 6, 104L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0, "drive back: requests succeed again");
+	ide_timeout_secs = 20;
+
+	/* polled fallback: a spin timeout resets the drive too */
+	fresh( 1);
+	int2_tbl[0] = 0;
+	tur( &cp, 6);
+	mock_drv[0].hang_on_cmd = 1;
+	ide_spins = 1000;
+	read10( &cp, 6, 105L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0x02, "polled, hung drive: CHECK CONDITION");
+	CHECK( mock_srst_count == 1 && ide_resets == 1 && mock_drv[0].hung == 0, "polled, hung drive: reset issued, drive un-hung");
+	CHECK( mock_nien == 1, "polled: interrupts stay disabled after the reset");
+	ide_spins = 200000;
+	read10( &cp, 6, 106L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 106L, buf, 512), "polled: next request GOOD");
+}
+
 static void
 test_nolba_drive_ignored()
 {
@@ -963,6 +1041,7 @@ main()
 	fprintf( stderr, "== test_slave_disabled_and_enabled\n"); test_slave_disabled_and_enabled();
 	fprintf( stderr, "== test_polled_timeout_does_not_hang\n"); test_polled_timeout_does_not_hang();
 	fprintf( stderr, "== test_watchdog\n"); test_watchdog();
+	fprintf( stderr, "== test_timeout_recovery\n"); test_timeout_recovery();
 	fprintf( stderr, "== test_nolba_drive_ignored\n"); test_nolba_drive_ignored();
 	fprintf( stderr, "== test_sync_cache\n"); test_sync_cache();
 	fprintf( stderr, "== test_sync_cache_queued\n"); test_sync_cache_queued();
