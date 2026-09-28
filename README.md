@@ -1,8 +1,8 @@
 # amix-gayle-ide — native Amix IDE driver for the Amiga 4000's onboard Gayle port
 
 A native **Amiga UNIX (Amix 2.1, Commodore's SVR4.0 port to the 68030 Amiga)** driver for the
-**Gayle IDE controller** built into the Amiga 4000 (and, through a board table, the A1200 and A600),
-so that Amix runs on an **unmodified A4000 with a 68030 CPU card** — no SCSI host adapter needed,
+**Gayle IDE controller** built into the Amiga 4000 (the board table also carries untested A1200/A600
+rows), so that Amix runs on an **unmodified A4000 with a 68030 CPU card** — no SCSI host adapter needed,
 root on a CF card. Amix shipped with no IDE driver at all; this repo closes that gap. It follows
 the framework, build environment and gotcha catalog of [`amix-a4091`](https://github.com/jusii/amix-a4091)
 and [`amix-z3660scsi`](https://github.com/jusii/amix-z3660scsi).
@@ -37,21 +37,24 @@ login works. To my knowledge the first Amix boot on an A4000 with root on IDE.
 - ✅ **Probe** `idepresent()` — AGA chipset gate via VPOSR, then a task-file write/readback at the
   A4000 base; on an A3000 it reads VPOSR and nothing else. Automatic detection is A4000-only.
 - ✅ **Command execution** `idequeue()` — READ/WRITE(6)/(10), REQUEST SENSE, INQUIRY, TEST UNIT READY,
-  READ CAPACITY(10), MODE SENSE(6), START/STOP UNIT, SYNCHRONIZE CACHE → ATA READ/WRITE SECTOR(S),
-  IDENTIFY DEVICE, FLUSH CACHE, with synthesised sense data. PIO only, LBA28.
+  READ CAPACITY(10), MODE SENSE(6), START/STOP UNIT, SYNCHRONIZE CACHE, VERIFY(10) → ATA READ/WRITE
+  SECTOR(S), IDENTIFY DEVICE, FLUSH CACHE, READ VERIFY SECTOR(S), with synthesised sense data. PIO
+  only, LBA28, LUN 0 only.
 - ✅ **Interrupt-driven I/O** `ideintr()` — level-2 handler hooked into `int2_tbl[]` by
   `kernel.c.patch`, one interrupt per sector, `timeout()` watchdog; falls back to polled I/O on an
   unpatched kernel. Emulation: 107k interrupts, 2 spurious, 0 timeouts; 10 MB raw read 3.4 s → 0.7 s sys.
 - ✅ **Native build** — compiles with the Amix K&R `cc` without diagnostics, links `checkunix`-clean
   through amix-kerntools, boots on an A3000 profile (probe silent) and the Amiberry A4000/AGA profile.
-- ✅ **Host harness** — the unmodified driver source against a mock Gayle/ATA model, 439 checks.
+- ✅ **Host harness** — the unmodified driver source against a mock Gayle/ATA model, 787 checks.
 - 🟡 **Board table** — A4000 entry proven; A1200/A600 entries (task file `0xDA0000`, latched INTREQ,
   Gayle ID register) follow NetBSD/Amiberry and are untested. They are never auto-detected: select
   one with `ide_board_force` (2 = A1200, 3 = A600), which is the only time the Gayle ID register at
   `0xDE1000` is read. Amix itself has further A1200/A600 blockers (fast RAM expected at `0x07000000`).
 - 🟡 **Open on real hardware** — stress and power-cycle `fsck` runs, spin-count calibration of the
-  bounded polled waits, the installer route. The **IDE slave** stays disabled unless `ide_slave_enable`
-  is set.
+  bounded polled waits, the installer route, the VPOSR id value as read on the A4000 (`0x23` PAL /
+  `0x33` NTSC expected), and cache inhibition of the register ranges (assumed from the stock kernel's
+  transparent-translation setup). These are the `[verify]` markers left in `src/ide.c`. The **IDE
+  slave** stays disabled unless `ide_slave_enable` is set.
 
 The IDE master is presented as **SCSI unit 6** (`ide_master_unit`) so that the stock root configuration
 `c6d0s1`, `/etc/vfstab` and the installer's assumptions of an A3000-installed system apply unchanged.
@@ -97,7 +100,7 @@ no `unix_boot` patches (68030 = stock `unix_boot` 1.1c).
 The host harness needs only a C compiler:
 
 ```sh
-make -C test/host check      # 439 checks, exit 0 == all pass
+make -C test/host check      # exit 0 == every check passed
 ```
 
 ## Hardware notes
@@ -107,8 +110,10 @@ make -C test/host check      # 439 checks, exit 0 == all pass
   returns "not mine" otherwise. No explicit interrupt acknowledge on the A4000 (reading STATUS drops it).
 - `0xDD2020` lies in the identity-mapped low 1 GB (`phystokv(p) == p`), so no `sptalloc()`; the 68030
   cache inhibit comes from the transparent-translation register, not from a per-page bit.
-- A 16-bit DATA read delivers ATA words with the bytes in natural order on the 68k, so sector data is
-  copied as is and only IDENTIFY words are byte-swapped — confirmed on the real machine.
+- A 16-bit DATA read returns the drive's little-endian ATA word byte-swapped relative to the 68k's
+  view, which is the drive's byte stream in natural order: sector data is copied as is, and only
+  IDENTIFY's words (numbers and the two-character string cells) are swapped once. Confirmed on the real
+  machine (2026-09-27: root mounts, model string and sector count decode).
 - The clock is a level-2 interrupt and `sdspl == spl2`, so `lbolt` is frozen inside the queue routine:
   polled waits are bounded spin counts, the interrupt path uses a `timeout()` watchdog.
 - A command that has not completed within `ide_timeout_secs` (interrupt path) or its spin budget
@@ -123,6 +128,18 @@ make -C test/host check      # 439 checks, exit 0 == all pass
   `amix-z3660scsi`'s `dd.c` ordering patch (start the next buffer, then `iodone`) to its IDE kernels;
   on a stock `dd.c` the guard alone keeps the queue sane.
 
+## Sharing a kernel with a SCSI host adapter
+
+The Amix SCSI layer numbers its controllers by ascending base address, and `0xDD2020` sorts below
+every Zorro card. In a kernel that carries this driver together with a SCSI host adapter driver
+(A4091, Z3660), an A4000 with an IDE disk attached therefore gets the IDE port as **card 0** and its
+master at `c6d0` — the very slot the stock root configuration names — while the SCSI adapter moves
+to card 1 and its disks change names; with two SCSI adapters already registered the IDE port is
+refused with `sd: too many controllers`. This driver does not arbitrate that: the amigaux.org build
+hub ships the IDE driver in an IDE-rooted kernel of its own and registers the port only when it is
+the sole controller. A hand-assembled shared kernel must decide which controller roots, or leave the
+IDE disk unplugged. The slave, when enabled, appears as unit 5 (`ide_slave_unit`).
+
 ## License
 
 The original work in this repo is released under the **MIT license** (see [`LICENSE`](LICENSE)):
@@ -134,9 +151,10 @@ file: the added lines are MIT, the few quoted stock context lines remain under t
 Commodore SVR4 copyright. See [`src/kernel-patches/NOTICE`](src/kernel-patches/NOTICE).
 
 Amix itself (SVR4.0), its disk images, Kickstart ROMs and manuals are proprietary Commodore software
-and are **not** included — you need your own Amix 2.1 system. Nothing from Commodore/AT&T or from
-GPL code is in this repo: the ATA behaviour follows the ATA-2 standard, and NetBSD's `wdc`/`gayle`
-sources (BSD) and Linux `gayle.c` (GPL) were read as documentation only.
+and are **not** included — you need your own Amix 2.1 system. No Commodore/AT&T or GPL code is
+reproduced in the driver, the harness or the docs; the kernel patch quotes a few unchanged stock lines
+as diff context, as noted above. The ATA behaviour follows the ATA-2 standard, and NetBSD's
+`wdc`/`gayle` sources (BSD) and Linux `gayle.c` (GPL) were read as documentation only.
 
 ## Credits
 

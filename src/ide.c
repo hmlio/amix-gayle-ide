@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * ide.c -- Amix (Commodore Amiga UNIX 2.1, SVR4 m68k) pseudo SCSI host adapter
- *          for the Gayle IDE port of the Amiga 4000 (and, through the board
- *          table, the A1200 and A600).
+ *          for the Gayle IDE port of the Amiga 4000.  (The board table also
+ *          carries A1200/A600 rows: untested, reachable only by ide_board_force.)
  *
  * Phase 2: interrupt-driven READ/WRITE (level 2, via int2_tbl[]) with a polled
  * fallback, PIO only, LBA28, master drive by default.
@@ -86,8 +86,10 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
  * Kernel virtual == physical for these ranges (sys/immu.h: phystokv(p) == p;
  * the low 1 GB is identity mapped through the 030 transparent translation
  * registers), so the driver dereferences plain addresses.  Cache inhibition
- * of the ranges is assumed from the TT registers (works on the real
- * A4000; the TT0/TT1 CI bits themselves are not yet read back).
+ * of these ranges on the 68030 is assumed from the transparent-translation
+ * registers (works on the real A4000; the TT0/TT1 CI bits themselves are not
+ * yet read back); the 68040/68060 line, with its copyback caches, needs
+ * explicit handling that this driver does not have.
  */
 /* Base addresses live in the board table (struct ideboard) -- never here. */
 #define IDE_SPAN	0x101BL		/* bytes from a task-file base to the last register + 1 */
@@ -112,7 +114,9 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
  * 0x20/0x30, AGA Alice 0x22/0x23/0x32/0x33 -- bit 4 (0x10) is the video
  * standard, the low nibble is >= 2 only for Alice.  (Testing "id >= 0x22", as
  * some sources do, misclassifies an NTSC ECS machine, id 0x30, as AGA.)
- * Verified against the Amiberry/WinUAE VPOSR model; [verify] on real hardware.
+ * Verified against the Amiberry/WinUAE VPOSR model; the A4000 boot of
+ * 2026-09-27 (CHANGELOG) passed this gate, the exact id read there was not
+ * recorded ([verify]: expected 0x23 PAL / 0x33 NTSC).
  */
 #define IDE_VPOSR_ADDR	0xDFF004L
 #define IDE_VPOSR_ID( v)	(((v) >> 8) & 0x7F)
@@ -254,7 +258,8 @@ int	ide_slave_unit  = 5;
 #endif
 ulong	ide_pagecross_n;		/* raw (<= IDE_NBPP) requests spanning two pages */
 
-#define IDE_DATA_SWAP	0		/* 1 if sector data must be byte swapped [verify] */
+#define IDE_DATA_SWAP	0		/* 1 if sector data must be byte swapped; 0 confirmed by the
+					 * 2026-09-27 A4000 boot (root mounted, files intact) */
 
 /* ------------------------------------------------------ register seam */
 
@@ -525,8 +530,9 @@ int	nwords;
  * the little-endian ATA words byte swapped relative to the 68k's view, so
  * every IDENTIFY word is swapped once: numeric fields become correct and the
  * ASCII strings (first character in bits 15:8 per ATA-2) come out in order.
- * Verified in the emulator (model string and sector count decode correctly);
- * [verify] on real hardware.  Sector data needs no swap (IDE_DATA_SWAP 0).
+ * Verified in the emulator and on the real A4000 (2026-09-27: model string
+ * and sector count decode correctly).  Sector data needs no swap
+ * (IDE_DATA_SWAP 0).
  */
 static int
 ide_identify( drive, id)
