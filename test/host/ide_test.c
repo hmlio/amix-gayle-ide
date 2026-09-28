@@ -739,6 +739,73 @@ test_queue_order()
 }
 
 /*
+ * SYNCHRONIZE CACHE in interrupt mode takes the queue: submitted behind a
+ * READ in flight and ahead of a WRITE, the FLUSH CACHE reaches the drive
+ * after the READ has finished and before the WRITE starts.
+ */
+static void
+test_sync_cache_queued()
+{
+	unsigned char	sync[10];
+	int		i;
+
+	fresh( 1);
+	{ struct sdcom cp; tur( &cp, 6); }
+	intr_calls = 0; qn = 0;
+	memset( sync, 0, sizeof sync); sync[0] = 0x35;
+	memset( qreq, 0, sizeof qreq);
+	qreq[0].cdb[0] = 0x28; qreq[0].cdb[5] = 90; qreq[0].cdb[8] = 2;
+	qreq[0].addr = qbuf[0]; qreq[0].nbyte = 1024;
+	memcpy( qreq[1].cdb, sync, 10);
+	qreq[2].cdb[0] = 0x2A; qreq[2].cdb[5] = 94; qreq[2].cdb[8] = 2;
+	qreq[2].addr = qbuf[2]; qreq[2].nbyte = 1024;
+	memset( qbuf[2], 0x3C, 1024);
+	for (i = 0; i < 3; ++i) { qreq[i].unit = 6; qreq[i].intr = qdone; }
+	mock_cmd_log_n = 0;
+	idequeue( 0, &qreq[0]);
+	idequeue( 0, &qreq[1]);
+	idequeue( 0, &qreq[2]);
+	CHECK( intr_calls == 0, "sync queued: nothing completes without interrupts");
+	CHECK( mock_cmd_count[0xE7] == 0, "sync queued: FLUSH not issued while the READ is on the cable");
+	pump();
+	CHECK( intr_calls == 3, "sync queued: READ, SYNC, WRITE all completed");
+	CHECK( qorder[0] == 0 && qorder[1] == 1 && qorder[2] == 2, "sync queued: completion order READ, SYNC, WRITE");
+	CHECK( mock_cmd_log_n == 3 && mock_cmd_log[0] == 0x20 && mock_cmd_log[1] == 0xE7 && mock_cmd_log[2] == 0x30,
+	       "sync queued: drive saw READ, FLUSH CACHE, WRITE in that order");
+	CHECK( qreq[1].okay && qreq[1].status == 0, "sync queued: SYNC GOOD");
+	CHECK( qreq[0].okay && qreq[0].status == 0 && disk_equals( 0, 90L, qbuf[0], 1024), "sync queued: READ data intact");
+	CHECK( qreq[2].okay && qreq[2].status == 0 && disk_equals( 0, 94L, qbuf[2], 1024), "sync queued: WRITE landed");
+	mock_fire_timeouts();				/* the armed watchdog tick finds nothing active */
+	CHECK( intr_calls == 3 && mock_timeouts_pending() == 0, "sync queued: watchdog tick idle, disarmed");
+	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after queued sync");
+
+	/* a drive without FLUSH CACHE: GOOD, no command, still through the queue */
+	fresh( 0);
+	mock_add_drive( 0, 4096L, "OLD DRIVE NO FLUSH", 0);
+	{ struct sdcom cp; tur( &cp, 6); run( &cp, 6, sync, 10, 0, 0);
+	  CHECK( cp.okay && cp.status == 0, "sync, no FLUSH support (interrupt mode): GOOD");
+	  CHECK( mock_cmd_count[0xE7] == 0, "sync, no FLUSH support: no command issued"); }
+
+	/* the FLUSH itself can time out like any queued command */
+	fresh( 1);
+	{ struct sdcom cp; unsigned char sense[18];
+	  tur( &cp, 6);
+	  mock_drv[0].mute_intrq = 1;
+	  ide_timeout_secs = 0;
+	  memset( &cp, 0, sizeof cp); memcpy( cp.cdb, sync, 10); cp.unit = 6; cp.intr = done;
+	  intr_calls = 0;
+	  idequeue( 0, &cp);
+	  pump();
+	  CHECK( intr_calls == 0 && mock_cmd_count[0xE7] == 1, "sync timeout: FLUSH issued, no interrupt yet");
+	  mock_fire_timeouts();
+	  CHECK( intr_calls == 1 && cp.okay && cp.status == 0x02, "sync timeout: watchdog completed it with CHECK CONDITION");
+	  mock_drv[0].mute_intrq = 0;
+	  ide_timeout_secs = 20;
+	  reqsense( &cp, 6, sense);
+	  CHECK( sense[2] == 0x04, "sync timeout: HARDWARE ERROR sense"); }
+}
+
+/*
  * dd.c's completion order (iodone before the trailing startio) can submit
  * the disk's one sdcom a second time while the first submission is still on
  * the cable or queued.  The duplicate must be ignored, not linked in again.
@@ -898,6 +965,7 @@ main()
 	fprintf( stderr, "== test_watchdog\n"); test_watchdog();
 	fprintf( stderr, "== test_nolba_drive_ignored\n"); test_nolba_drive_ignored();
 	fprintf( stderr, "== test_sync_cache\n"); test_sync_cache();
+	fprintf( stderr, "== test_sync_cache_queued\n"); test_sync_cache_queued();
 	fprintf( stderr, "== test_read6\n"); test_read6();
 	fprintf( stderr, "== test_queue_order\n"); test_queue_order();
 	fprintf( stderr, "== test_persistent_sdcom_resubmit\n"); test_persistent_sdcom_resubmit();

@@ -766,6 +766,7 @@ static struct sdcom	*ide_qhead, *ide_qtail, *ide_active;
 static struct {
 	struct ideunit	*u;
 	int		drive, write;
+	int		flush;		/* SYNCHRONIZE CACHE: one FLUSH CACHE, no data */
 	ulong		lba;		/* next LBA to issue / transfer */
 	ulong		left;		/* sectors of the request not yet transferred */
 	ulong		cmdleft;	/* sectors still to move in the current ATA command */
@@ -864,9 +865,10 @@ int	err;
 }
 
 /*
- * Issue the next ATA command of the active transfer.  A write must be primed
+ * Issue the next ATA command of the active request.  A write must be primed
  * with its first sector before the drive interrupts; a read interrupts as soon
- * as the first sector is ready.
+ * as the first sector is ready; a FLUSH CACHE interrupts once, when done, and
+ * moves no data (ideintr() sees cmdleft == 0 and left == 0 and finishes).
  */
 static void
 ide_issue()
@@ -874,6 +876,10 @@ ide_issue()
 	ulong	n;
 	int	st;
 
+	if (ide_x.flush && !ide_x.u->flush) {	/* nothing to flush on an old drive */
+		ide_finish( 0);
+		return;
+	}
 	n = ide_x.left > IDE_MAXSECT ? IDE_MAXSECT : ide_x.left;
 	st = ide_select( ide_x.drive);
 	if (st < 0 || !(st & IDE_ST_DRDY)) {
@@ -882,7 +888,11 @@ ide_issue()
 		return;
 	}
 	ide_x.cmdleft = n;
-	ide_program( ide_x.drive, ide_x.write, ide_x.lba, n);
+	if (ide_x.flush) {
+		TW( IDE_REG_COMMAND, IDE_CMD_FLUSH);
+		ide_settle();
+	} else
+		ide_program( ide_x.drive, ide_x.write, ide_x.lba, n);
 	if (ide_x.write) {
 		st = ide_wait_drq( ide_spins_short);
 		if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
@@ -915,7 +925,11 @@ ide_start()
 	/* the transfer description is rebuilt from the CDB, so queued requests
 	 * need no side storage beyond cp->next */
 	ide_x.write = (cp->cdb[0] == SC_WRITE10 || cp->cdb[0] == SC_WRITE6);
-	if (cp->cdb[0] == SC_READ6 || cp->cdb[0] == SC_WRITE6) {
+	ide_x.flush = (cp->cdb[0] == SC_SYNC_CACHE);
+	if (ide_x.flush) {
+		ide_x.lba  = 0;
+		ide_x.left = 0;
+	} else if (cp->cdb[0] == SC_READ6 || cp->cdb[0] == SC_WRITE6) {
 		ide_x.lba  = ((ulong)(cp->cdb[1] & 0x1F) << 16) | ((ulong)cp->cdb[2] << 8) | cp->cdb[3];
 		ide_x.left = cp->cdb[4] ? cp->cdb[4] : 256;
 	} else {
@@ -1154,6 +1168,17 @@ struct sdcom	*cp;
 		break;
 
 	case SC_SYNC_CACHE:
+		/* Interrupt mode: take the queue like a transfer, so the flush
+		 * runs after the writes queued before it and never overwrites
+		 * the task file of a command in flight.  Polled mode has
+		 * nothing in flight and flushes inline. */
+		if (ide_use_intr) {
+			ide_enqueue( cp);
+			if (ide_active == 0)
+				ide_start();
+			splx( s);
+			return TRUE;		/* completes from ideintr() */
+		}
 		if (ide_flush( u, drive) < 0)
 			cp->status = SC_CHECK;
 		break;

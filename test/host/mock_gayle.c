@@ -43,6 +43,8 @@ int			mock_vposr_override;
 unsigned long		mock_accesses, mock_bad_accesses, mock_taskfile_accesses, mock_slave_selects;
 unsigned long		mock_cmd_count[256], mock_irq_acks, mock_id_reads;
 int			mock_last_cmd = -1;
+int			mock_cmd_log[64];
+int			mock_cmd_log_n;
 int			mock_nien, mock_intrq, mock_irq_latch;
 unsigned char		mock_intena;
 
@@ -82,6 +84,7 @@ mock_reset()
 	mock_accesses = mock_bad_accesses = mock_taskfile_accesses = mock_slave_selects = 0;
 	mock_irq_acks = mock_id_reads = 0;
 	mock_last_cmd = -1;
+	mock_cmd_log_n = 0;
 	mock_nien = 1;				/* ATA default after reset: interrupts off? no -- 0.  Driver sets it. */
 	mock_nien = 0;
 	mock_intrq = mock_irq_latch = 0;
@@ -245,6 +248,8 @@ int	cmd;
 
 	mock_cmd_count[cmd]++;
 	mock_last_cmd = cmd;
+	if (mock_cmd_log_n < 64)
+		mock_cmd_log[mock_cmd_log_n++] = cmd;
 	if (!d->present)
 		return;
 	r_error = 0;

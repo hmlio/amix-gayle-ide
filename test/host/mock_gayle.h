@@ -48,6 +48,8 @@ extern unsigned long		mock_taskfile_accesses;	/* task-file accesses on the selec
 extern unsigned long		mock_slave_selects;	/* SDH writes with DRV1 set */
 extern unsigned long		mock_cmd_count[256];	/* commands issued, by opcode */
 extern int			mock_last_cmd;
+extern int			mock_cmd_log[64];	/* opcodes in issue order */
+extern int			mock_cmd_log_n;
 extern int			mock_nien;		/* drive's nIEN (1 = interrupts off) */
 extern int			mock_intrq;		/* drive asserting INTRQ */
 extern int			mock_irq_latch;		/* A1200/A600 INTREQ bit 7 */
