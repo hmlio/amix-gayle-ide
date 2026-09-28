@@ -29,7 +29,9 @@
  *  - Kernel virtual == physical (sys/immu.h: phystokv(p) == p), so PIO copies
  *    go straight to cp->addr.  Requests are <= NBPP (2048) bytes for raw I/O
  *    and 8 KB (UFS block) from the buffer cache, physically contiguous, exactly
- *    as the stock DMA host adapters receive them.
+ *    as the stock DMA host adapters receive them.  A raw request that crosses
+ *    a page boundary is the one shape whose second page is not guaranteed to
+ *    follow the first; ide_pagecross_n counts those (IDE_NBPP).
  *  - sdspl is spl2 (sd.h).  Level-2 handlers (int2_tbl[] in master.d/kernel.c,
  *    walked by amiga/ml/ttrap.s p2int for every INT2 after it clears the
  *    INTREQ PORTS bit) run at IPL 2, so idequeue()'s spl2 bracket and ideintr()
@@ -241,6 +243,15 @@ int	ide_debug        = 0;		/* 0 quiet, 1 attach/errors, 2 every command */
  */
 int	ide_master_unit = 6;
 int	ide_slave_unit  = 5;
+
+/*
+ * Kernel page size, for the page-crossing check on raw requests: 2048 on the
+ * 68030 kernel, 4096 on the 68040/68060 line (build with -DIDE_NBPP=4096).
+ */
+#ifndef IDE_NBPP
+#define IDE_NBPP	2048L
+#endif
+ulong	ide_pagecross_n;		/* raw (<= IDE_NBPP) requests spanning two pages */
 
 #define IDE_DATA_SWAP	0		/* 1 if sector data must be byte swapped [verify] */
 
@@ -1246,6 +1257,11 @@ struct sdcom	*cp;
 			ide_setsense( u, SK_ILLEGAL, ASC_INVALID_CDB_FIELD, 0);
 			cp->status = SC_CHECK;
 			break;
+		}
+		if ((ulong)cp->nbyte <= IDE_NBPP
+		    && (((ulong)data ^ ((ulong)data + cp->nbyte - 1)) & ~(IDE_NBPP - 1))) {
+			if (ide_pagecross_n++ == 0 || ide_debug)
+				printf( "ide: raw request of %d bytes crosses a page boundary\n", cp->nbyte);
 		}
 		if (nblk == 0 || lba + nblk > u->nsectors) {
 			ide_setsense( u, SK_ILLEGAL, ASC_LBA_OUT_OF_RANGE, 0);

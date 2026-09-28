@@ -25,7 +25,7 @@ extern void	idereset();
 extern void	ideintr();
 extern unsigned long	ide_spins, ide_spins_reset, ide_spins_short, ide_cq_overflow;
 extern unsigned long	ide_intr_count, ide_intr_spurious, ide_intr_timeouts, ide_timeout_secs;
-extern unsigned long	ide_dup_submits, ide_resets;
+extern unsigned long	ide_dup_submits, ide_resets, ide_pagecross_n;
 extern int	ide_slave_enable, ide_debug, ide_master_unit, ide_slave_unit;
 extern int	ide_intr_enable, ide_board_force;
 
@@ -74,7 +74,7 @@ int	unit_count;
 	ide_spins_reset = 200000;
 	ide_spins_short = 20000;
 	ide_intr_count = ide_intr_spurious = ide_intr_timeouts = 0;
-	ide_dup_submits = ide_resets = 0;
+	ide_dup_submits = ide_resets = ide_pagecross_n = 0;
 	if (unit_count >= 1)
 		mock_add_drive( 0, 4096L, "MOCK CF CARD 2GB", 1);
 	if (unit_count >= 2)
@@ -764,6 +764,31 @@ test_sync_cache()
 	CHECK( mock_cmd_count[0xE7] == 0, "no FLUSH CACHE on a drive that lacks it");
 }
 
+/* a raw request (<= one page) that straddles a page boundary is counted */
+static void
+test_pagecross_counter()
+{
+	struct sdcom	cp;
+	static char	big[6 * 2048];
+	char		*p;
+
+	fresh( 1);
+	tur( &cp, 6);
+	p = big + (2048 - ((unsigned long)big & 2047)) % 2048;	/* first page-aligned byte */
+	read10( &cp, 6, 10L, 2, p, 1024);
+	CHECK( cp.okay && cp.status == 0 && ide_pagecross_n == 0, "aligned 1 KB request: not counted");
+	read10( &cp, 6, 12L, 1, p + 2048 - 256, 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 12L, p + 2048 - 256, 512), "straddling request still served");
+	CHECK( ide_pagecross_n == 1, "512 B request straddling a page boundary: counted");
+	CHECK( strstr( mock_console, "crosses a page boundary") != 0, "first crossing logged");
+	read10( &cp, 6, 14L, 4, p + 2048 - 512, 2048);
+	CHECK( ide_pagecross_n == 2, "2 KB request straddling a page boundary: counted");
+	read10( &cp, 6, 20L, 16, p, 8192);
+	CHECK( cp.okay && cp.status == 0 && ide_pagecross_n == 2, "8 KB buffer-cache block: spans pages by nature, not counted");
+	read10( &cp, 6, 40L, 4, p + 2048, 2048);
+	CHECK( ide_pagecross_n == 2, "page-aligned full page: not counted");
+}
+
 static void
 test_read6()
 {
@@ -1045,6 +1070,7 @@ main()
 	fprintf( stderr, "== test_nolba_drive_ignored\n"); test_nolba_drive_ignored();
 	fprintf( stderr, "== test_sync_cache\n"); test_sync_cache();
 	fprintf( stderr, "== test_sync_cache_queued\n"); test_sync_cache_queued();
+	fprintf( stderr, "== test_pagecross_counter\n"); test_pagecross_counter();
 	fprintf( stderr, "== test_read6\n"); test_read6();
 	fprintf( stderr, "== test_queue_order\n"); test_queue_order();
 	fprintf( stderr, "== test_persistent_sdcom_resubmit\n"); test_persistent_sdcom_resubmit();
