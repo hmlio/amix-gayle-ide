@@ -152,6 +152,7 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
 #define IDE_CMD_RECAL		0x10
 #define IDE_CMD_READ		0x20	/* READ SECTOR(S) with retry */
 #define IDE_CMD_WRITE		0x30	/* WRITE SECTOR(S) with retry */
+#define IDE_CMD_VERIFY		0x40	/* READ VERIFY SECTOR(S) with retry: no data */
 #define IDE_CMD_READMULT	0xC4
 #define IDE_CMD_WRITEMULT	0xC5
 #define IDE_CMD_SETMULT		0xC6
@@ -648,10 +649,10 @@ ide_reset_drive()
 
 /* --------------------------------------------------------- polled I/O */
 
-/* Program the task file for `n' sectors at `lba' and issue the command. */
+/* Program the task file for `n' sectors at `lba' and issue ATA command `cmd'. */
 static void
-ide_program( drive, write, lba, n)
-int	drive, write;
+ide_program( drive, cmd, lba, n)
+int	drive, cmd;
 ulong	lba, n;
 {
 	TW( IDE_REG_NSECT, n & 0xFF);			/* 256 -> 0 */
@@ -660,8 +661,44 @@ ulong	lba, n;
 	TW( IDE_REG_HCYL, (lba >> 16) & 0xFF);
 	TW( IDE_REG_SDH,   IDE_SDH_FIXED | IDE_SDH_LBA
 			 | (drive ? IDE_SDH_DRV1 : 0) | ((lba >> 24) & IDE_SDH_HEAD));
-	TW( IDE_REG_COMMAND, write ? IDE_CMD_WRITE : IDE_CMD_READ);
+	TW( IDE_REG_COMMAND, cmd);
 	ide_settle();
+}
+
+/*
+ * Polled READ VERIFY SECTOR(S): the drive reads and checks `nsect' sectors
+ * from `lba' without transferring them.  Returns 0 or -1 (sense set).
+ */
+static int
+ide_verify_polled( u, drive, lba, nsect)
+struct ideunit	*u;
+int		drive;
+ulong		lba, nsect;
+{
+	ulong	chunk;
+	int	st;
+
+	while (nsect > 0) {
+		chunk = nsect > IDE_MAXSECT ? IDE_MAXSECT : nsect;
+		st = ide_select( drive);
+		if (st < 0 || !(st & IDE_ST_DRDY)) {
+			ide_setsense( u, SK_NOT_READY, ASC_LUN_NOT_READY, 0);
+			return -1;
+		}
+		ide_program( drive, IDE_CMD_VERIFY, lba, chunk);
+		st = ide_wait( IDE_ST_BSY, 0, ide_spins);
+		if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
+			if (st < 0) {
+				ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+				ide_reset_drive();
+			} else
+				ide_ataerror( u, st, 0);
+			return -1;
+		}
+		lba   += chunk;
+		nsect -= chunk;
+	}
+	return 0;
 }
 
 /*
@@ -687,7 +724,7 @@ ulong		nbyte;
 			ide_setsense( u, SK_NOT_READY, ASC_LUN_NOT_READY, 0);
 			return -1;
 		}
-		ide_program( drive, write, lba, chunk);
+		ide_program( drive, write ? IDE_CMD_WRITE : IDE_CMD_READ, lba, chunk);
 		for (n = 0; n < (int)chunk; ++n) {
 			st = ide_wait_drq( ide_spins);
 			if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
@@ -811,7 +848,9 @@ static struct sdcom	*ide_qhead, *ide_qtail, *ide_active;
 static struct {
 	struct ideunit	*u;
 	int		drive, write;
-	int		flush;		/* SYNCHRONIZE CACHE: one FLUSH CACHE, no data */
+	int		nodata;		/* 0: READ/WRITE; else the ATA command that moves no data
+				 * (FLUSH CACHE, READ VERIFY) -- one interrupt per command */
+	ulong		cmdn;		/* sectors covered by the current no-data command */
 	ulong		lba;		/* next LBA to issue / transfer */
 	ulong		left;		/* sectors of the request not yet transferred */
 	ulong		cmdleft;	/* sectors still to move in the current ATA command */
@@ -914,8 +953,9 @@ int	err;
 /*
  * Issue the next ATA command of the active request.  A write must be primed
  * with its first sector before the drive interrupts; a read interrupts as soon
- * as the first sector is ready; a FLUSH CACHE interrupts once, when done, and
- * moves no data (ideintr() sees cmdleft == 0 and left == 0 and finishes).
+ * as the first sector is ready; a no-data command (FLUSH CACHE, READ VERIFY)
+ * interrupts once, when done (ideintr() sees cmdleft == 0, accounts for the
+ * sectors it covered and finishes or issues the next chunk).
  */
 static void
 ide_issue()
@@ -923,7 +963,7 @@ ide_issue()
 	ulong	n;
 	int	st;
 
-	if (ide_x.flush && !ide_x.u->flush) {	/* nothing to flush on an old drive */
+	if (ide_x.nodata == IDE_CMD_FLUSH && !ide_x.u->flush) {	/* old drive: nothing to flush */
 		ide_finish( 0);
 		return;
 	}
@@ -934,12 +974,18 @@ ide_issue()
 		ide_finish( -1);
 		return;
 	}
-	ide_x.cmdleft = n;
-	if (ide_x.flush) {
-		TW( IDE_REG_COMMAND, IDE_CMD_FLUSH);
-		ide_settle();
-	} else
-		ide_program( ide_x.drive, ide_x.write, ide_x.lba, n);
+	if (ide_x.nodata) {
+		ide_x.cmdleft = 0;
+		ide_x.cmdn = n;
+		if (ide_x.nodata == IDE_CMD_FLUSH) {
+			TW( IDE_REG_COMMAND, IDE_CMD_FLUSH);
+			ide_settle();
+		} else
+			ide_program( ide_x.drive, ide_x.nodata, ide_x.lba, n);
+	} else {
+		ide_x.cmdleft = n;
+		ide_program( ide_x.drive, ide_x.write ? IDE_CMD_WRITE : IDE_CMD_READ, ide_x.lba, n);
+	}
 	if (ide_x.write) {
 		st = ide_wait_drq( ide_spins_short);
 		if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
@@ -972,8 +1018,10 @@ ide_start()
 	/* the transfer description is rebuilt from the CDB, so queued requests
 	 * need no side storage beyond cp->next */
 	ide_x.write = (cp->cdb[0] == SC_WRITE10 || cp->cdb[0] == SC_WRITE6);
-	ide_x.flush = (cp->cdb[0] == SC_SYNC_CACHE);
-	if (ide_x.flush) {
+	ide_x.nodata = cp->cdb[0] == SC_SYNC_CACHE ? IDE_CMD_FLUSH
+		     : cp->cdb[0] == SC_VERIFY10   ? IDE_CMD_VERIFY : 0;
+	ide_x.cmdn = 0;
+	if (ide_x.nodata == IDE_CMD_FLUSH) {
 		ide_x.lba  = 0;
 		ide_x.left = 0;
 	} else if (cp->cdb[0] == SC_READ6 || cp->cdb[0] == SC_WRITE6) {
@@ -1043,6 +1091,10 @@ ideintr()
 			ide_ataerror( ide_x.u, st, ide_x.write);
 		ide_finish( -1);
 		return;
+	}
+	if (ide_x.nodata) {			/* the command covered cmdn sectors */
+		ide_x.lba  += ide_x.cmdn;
+		ide_x.left  = ide_x.left > ide_x.cmdn ? ide_x.left - ide_x.cmdn : 0;
 	}
 	if (ide_x.left > 0)
 		ide_issue();
@@ -1157,8 +1209,36 @@ struct sdcom	*cp;
 	case SC_TUR:
 	case SC_REZERO:
 	case SC_START_STOP:
-	case SC_VERIFY10:
 	case SC_MODE_SELECT6:
+		break;
+
+	case SC_VERIFY10:
+		/* READ VERIFY SECTOR(S): the drive checks the sectors, no data
+		 * moves.  BYTCHK (compare against supplied data) is not offered. */
+		if (cp->cdb[1] & 0x02) {
+			ide_setsense( u, SK_ILLEGAL, ASC_INVALID_CDB_FIELD, 0);
+			cp->status = SC_CHECK;
+			break;
+		}
+		lba  = ((ulong)cp->cdb[2] << 24) | ((ulong)cp->cdb[3] << 16)
+		     | ((ulong)cp->cdb[4] << 8)  | cp->cdb[5];
+		nblk = ((ulong)cp->cdb[7] << 8) | cp->cdb[8];
+		if (nblk == 0)
+			break;				/* nothing to verify: GOOD */
+		if (lba + nblk > u->nsectors) {
+			ide_setsense( u, SK_ILLEGAL, ASC_LBA_OUT_OF_RANGE, 0);
+			cp->status = SC_CHECK;
+			break;
+		}
+		if (ide_use_intr) {
+			ide_enqueue( cp);
+			if (ide_active == 0)
+				ide_start();
+			splx( s);
+			return TRUE;		/* completes from ideintr() */
+		}
+		if (ide_verify_polled( u, drive, lba, nblk) < 0)
+			cp->status = SC_CHECK;
 		break;
 
 	case SC_REQ_SENSE:

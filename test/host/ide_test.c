@@ -841,6 +841,81 @@ test_queue_order()
 	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after queue drain");
 }
 
+static void
+verify10( cp, unit, lba, nblk, bytchk)
+struct sdcom	*cp;
+int		unit, nblk, bytchk;
+unsigned long	lba;
+{
+	unsigned char	cdb[10];
+
+	memset( cdb, 0, sizeof cdb);
+	cdb[0] = 0x2F; cdb[1] = bytchk ? 0x02 : 0;
+	cdb[2] = lba >> 24; cdb[3] = lba >> 16; cdb[4] = lba >> 8; cdb[5] = lba;
+	cdb[7] = nblk >> 8; cdb[8] = nblk;
+	run( cp, unit, cdb, 10, 0, 0);
+}
+
+/* VERIFY(10) is executed as READ VERIFY SECTOR(S), not answered blindly */
+static void
+test_verify()
+{
+	struct sdcom	cp;
+	unsigned char	sense[18];
+	static char	buf[512];
+	int		i;
+
+	fresh( 1);
+	tur( &cp, 6);
+	verify10( &cp, 6, 100L, 4, 0);
+	CHECK( cp.okay && cp.status == 0, "VERIFY 4 sectors: GOOD");
+	CHECK( mock_cmd_count[0x40] == 1 && mock_cmd_count[0x20] == 0, "VERIFY: one READ VERIFY, no READ");
+	verify10( &cp, 6, 200L, 300, 0);
+	CHECK( cp.okay && cp.status == 0 && mock_cmd_count[0x40] == 3, "VERIFY 300 sectors: split into two commands");
+	verify10( &cp, 6, 4090L, 6, 0);
+	CHECK( cp.okay && cp.status == 0, "VERIFY up to the last sector: GOOD");
+	verify10( &cp, 6, 4090L, 7, 0);
+	CHECK( cp.okay && cp.status == 0x02 && mock_cmd_count[0x40] == 4, "VERIFY past the end: CHECK, rejected before the drive");
+	reqsense( &cp, 6, sense);
+	CHECK( sense[2] == 0x05 && sense[12] == 0x21, "VERIFY past the end: ILLEGAL REQUEST / LBA out of range");
+	verify10( &cp, 6, 10L, 1, 1);
+	CHECK( cp.okay && cp.status == 0x02, "VERIFY with BYTCHK: CHECK");
+	reqsense( &cp, 6, sense);
+	CHECK( sense[2] == 0x05 && sense[12] == 0x24, "VERIFY with BYTCHK: invalid field in CDB");
+	verify10( &cp, 6, 10L, 0, 0);
+	CHECK( cp.okay && cp.status == 0 && mock_cmd_count[0x40] == 4, "VERIFY of zero blocks: GOOD, no command");
+	mock_drv[0].unc_lba = 302;
+	verify10( &cp, 6, 300L, 4, 0);
+	CHECK( cp.okay && cp.status == 0x02, "VERIFY over a bad sector: CHECK");
+	reqsense( &cp, 6, sense);
+	CHECK( sense[2] == 0x03 && sense[12] == 0x11, "VERIFY over a bad sector: MEDIUM ERROR / read error");
+	mock_drv[0].unc_lba = -1;
+
+	/* queued behind a READ: the drive sees READ, then READ VERIFY */
+	intr_calls = 0; qn = 0;
+	memset( qreq, 0, sizeof qreq);
+	qreq[0].cdb[0] = 0x28; qreq[0].cdb[5] = 30; qreq[0].cdb[8] = 2;
+	qreq[0].addr = qbuf[0]; qreq[0].nbyte = 1024;
+	qreq[1].cdb[0] = 0x2F; qreq[1].cdb[5] = 30; qreq[1].cdb[8] = 2;
+	for (i = 0; i < 2; ++i) { qreq[i].unit = 6; qreq[i].intr = qdone; }
+	mock_cmd_log_n = 0;
+	idequeue( 0, &qreq[0]);
+	idequeue( 0, &qreq[1]);
+	pump();
+	CHECK( intr_calls == 2 && qorder[0] == 0 && qorder[1] == 1, "VERIFY queued behind a READ: completes after it");
+	CHECK( mock_cmd_log_n == 2 && mock_cmd_log[0] == 0x20 && mock_cmd_log[1] == 0x40, "drive saw READ then READ VERIFY");
+	CHECK( qreq[1].okay && qreq[1].status == 0 && disk_equals( 0, 30L, qbuf[0], 1024), "both GOOD, READ data intact");
+
+	/* polled fallback */
+	fresh( 1);
+	int2_tbl[0] = 0;
+	tur( &cp, 6);
+	verify10( &cp, 6, 50L, 3, 0);
+	CHECK( cp.okay && cp.status == 0 && mock_cmd_count[0x40] == 1, "VERIFY polled: GOOD, one command");
+	read10( &cp, 6, 50L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 50L, buf, 512), "polled READ after VERIFY: GOOD");
+}
+
 /*
  * SYNCHRONIZE CACHE in interrupt mode takes the queue: submitted behind a
  * READ in flight and ahead of a WRITE, the FLUSH CACHE reaches the drive
@@ -1070,6 +1145,7 @@ main()
 	fprintf( stderr, "== test_nolba_drive_ignored\n"); test_nolba_drive_ignored();
 	fprintf( stderr, "== test_sync_cache\n"); test_sync_cache();
 	fprintf( stderr, "== test_sync_cache_queued\n"); test_sync_cache_queued();
+	fprintf( stderr, "== test_verify\n"); test_verify();
 	fprintf( stderr, "== test_pagecross_counter\n"); test_pagecross_counter();
 	fprintf( stderr, "== test_read6\n"); test_read6();
 	fprintf( stderr, "== test_queue_order\n"); test_queue_order();

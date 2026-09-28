@@ -284,6 +284,18 @@ int	cmd;
 			r_status[sel] = ST_DRDY | ST_DSC | ST_DRQ;	/* no INTRQ for the first sector */
 		}
 		break;
+	case 0x40:			/* READ VERIFY SECTOR(S): no data phase */
+		if (!(r_sdh & 0x40)) { fail( ER_ABRT); break; }
+		n = r_nsect ? r_nsect : 256;
+		xlba = lba();
+		if (xlba + n > d->nsectors) { fail( ER_IDNF); break; }
+		if (d->unc_lba >= 0 && (unsigned long)d->unc_lba >= xlba && (unsigned long)d->unc_lba < xlba + n) {
+			fail( ER_UNC);
+			break;
+		}
+		r_status[sel] = ST_DRDY | ST_DSC;
+		raise_intrq();
+		break;
 	case 0xE7:			/* FLUSH CACHE */
 		if (d->flush) {
 			r_status[sel] = ST_DRDY | ST_DSC;
