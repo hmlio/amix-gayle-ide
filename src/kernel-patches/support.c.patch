@@ -1,0 +1,65 @@
+A3000-vs-A4000 SCSI auto-detection for the Amix kernel -- carried by amix-gayle-ide.
+
+Derived from amix-a4091/src/kernel-patches/support.c.patch (MIT, (c) 2026 Jussi
+Alanara), with one change: the AGA test uses the low nibble of the VPOSR id
+instead of "id >= 0x22", which misclassified NTSC ECS machines (id 0x30) as AGA
+(see docs/vposr-aga-gate.md).  Everything below the header is the
+upstream patch text plus that change; it contains no Amix source, only the
+replacement lines for the phantom-A3000 heuristic in autocon().
+
+Why the IDE driver needs it: the stock autocon() registers a non-existent A3000
+SCSI controller at 0xDD0000 on any machine with more than 7 MB, which on an A4000
+would be card 0 (panics on first use) and push the IDE controller to card 1.
+With this patch the A4000 has no phantom, IDE becomes card 0 and the master
+appears as c6d0 (ide_master_unit), so an image installed on an A3000 boots
+unchanged.  On an A3000 the WD33C93 probe finds the real controller.
+
+Apply against a stock Amix 2.1 source tree (amix-kerntools does this):
+    cd /usr/sys && patch -p0 < support.c.patch       # target: amiga/kernel/support.c
+
+--- amiga/kernel/support.c.orig	2026-06-24 13:06:37.503297920 +0300
++++ amiga/kernel/support.c	2026-06-24 13:06:37.506131770 +0300
+@@ -302,9 +302,40 @@
+ {
+ 	register int i;
+ 
+-	if (index==0 && end > (char *)0x07000000 && (pc==0x0202F003)) {
+-		*bp = 0xdd0000;
+-		return 1;
++	/*
++	 * The A3000 internal SCSI (Commodore DMAC + WD33C93 @ 0xDD0000) is not
++	 * an AutoConfig board, so it never appears in bootinfo.autocon[].  Auto-
++	 * detect it instead of assuming it from RAM size.  An A4000 (AGA) has
++	 * none -- and we must NOT touch 0xDD0000 there -- so gate the probe on
++	 * the chipset: only A3000-class (ECS/OCS) machines have it.  VPOSR bits
++	 * 8..14: OCS 0x00/0x10, ECS 0x20/0x30, AGA Alice 0x22/0x23/0x32/0x33 --
++	 * bit 4 is the video standard, the low nibble is >= 2 only for Alice.
++	 */
++	if (index==0 && (pc==0x0202F003)) {
++		int a3kscsi = 0;
++		unsigned short vposr = *(volatile unsigned short *)0xDFF004;
++
++		if ((((int)vposr >> 8) & 0x0F) < 2) {		/* Agnus: A3000-class, not AGA/A4000 */
++			/* Two-register anti-alias probe via the indirect SASR/SCMD
++			 * ports (harmless scratch regs; chip is reset later). */
++			volatile unsigned char *sasr = (unsigned char *)0xDD0041;
++			volatile unsigned char *scmd = (unsigned char *)0xDD0043;
++
++			*sasr = 0x02; *scmd = 0x55;	/* WD33C93 reg 0x02 <- 0x55 */
++			*sasr = 0x03; *scmd = 0xAA;	/* reg 0x03 <- 0xAA via same data port */
++			*sasr = 0x02;			/* re-select reg 0x02 */
++			if (*scmd == 0x55) {		/* real chip keeps reg2==0x55; open bus */
++				*sasr = 0x03;		/* aliases 0xDD0043 to the last write 0xAA */
++				if (*scmd == 0xAA)	/* both regs distinct => a real WD33C93 */
++					a3kscsi = 1;
++			}
++		}
++		if (a3kscsi) {
++			*bp = 0xdd0000;
++			return 1;
++		}
++		/* absent: fall through; the table search cannot match the synthetic
++		 * 0x0202F003, so autocon returns 0 and sd.c never registers it. */
+ 	}
+ 
+ 	/*

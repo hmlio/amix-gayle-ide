@@ -1,0 +1,32 @@
+NOTICE — src/kernel-patches/
+
+This directory ships unified diffs against stock Amiga UNIX (Amix) SVR4.0
+kernel sources -- NOT the Amix source files themselves.
+
+    kernel.c.patch    Adds ideintr() to the NULL-terminated int2_tbl[] in
+                      master.d/kernel.c, the kernel's only hook for level-2
+                      (PORTS) interrupt handlers.  Optional: the driver scans
+                      the table at attach time and runs polled if the hook
+                      is missing.
+
+    support.c.patch   Replaces the RAM-size heuristic in autocon() that
+                      registers a phantom A3000 SCSI controller on any
+                      machine with more than 7 MB with a chipset gate plus a
+                      WD33C93 probe, so that on an A4000 the IDE port becomes
+                      card 0.  Derived from amix-a4091's support.c.patch
+                      (MIT, (c) 2026 Jussi Alanara) with the AGA gate changed
+                      to the low nibble of the VPOSR id (see
+                      ../../docs/vposr-aga-gate.md).  Do not apply both this
+                      patch and amix-a4091's to the same tree.
+
+Apply with `patch -p0` from /usr/sys against a stock Amix 2.1 tree; the
+kerntools harness applies them (and skips a patch that is already applied).
+
+The added/changed lines in the patches are our work, offered under this
+repository's MIT license (see ../../LICENSE).  The few unchanged context lines
+quoted from the stock files remain under their original Commodore SVR4
+copyright.
+
+The SCSI controller-table rows (sd.c scsicard[] / externs / sdcardbase) and the
+kernel Makefile OBJ entry are NOT kept here -- kerntools generates them from
+../../driver.conf.

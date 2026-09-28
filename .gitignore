@@ -1,0 +1,8 @@
+build/
+core
+*~
+.DS_Store
+
+# Local AI-agent / assistant files (never published)
+CLAUDE.md
+.claude/

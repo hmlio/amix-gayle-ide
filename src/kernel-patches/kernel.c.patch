@@ -1,0 +1,29 @@
+Register the Gayle IDE level-2 interrupt handler -- amix-gayle-ide.
+
+The Amix kernel has exactly one hook for level-2 (PORTS) interrupts: the
+NULL-terminated int2_tbl[] in master.d/kernel.c, walked by amiga/ml/ttrap.s
+p2int for every INT2.  This adds ideintr (defined in amiga/alien/ide.c) to that
+table.  The driver looks for itself in the table at attach time and falls back
+to polled I/O if this patch is missing, so the patch is optional but wanted.
+
+Apply against a stock (or 2.1c-patched) Amix 2.1 source tree (amix-kerntools
+does this):
+    cd /usr/sys && patch -p0 < kernel.c.patch       # target: master.d/kernel.c
+
+--- master.d/kernel.c.orig	2026-09-27 00:00:00.000000000 +0200
++++ master.d/kernel.c	2026-09-27 00:00:00.000000000 +0200
+@@ -183,11 +183,13 @@
+ /* Miscellaneous kernel data */
+ 
+ extern void aciaaintr(), jbintr(), a2091intr(), a3091intr(), aenintr();
++extern void ideintr();
+ void	(*int2_tbl[])() = {
+ 	aciaaintr,		/* ACIAA (parallel/kbd) ISR */
+ 	jbintr,			/* A2090 ISR */
+ 	a2091intr,		/* A2091 ISR */
+ 	a3091intr,		/* A3000 internal SCSI ISR */
+ 	aenintr,		/* A2065 Ethernet ISR */
++	ideintr,		/* Gayle IDE ISR (amix-gayle-ide) */
+ 	0};
+ 
+ extern void parinit();
