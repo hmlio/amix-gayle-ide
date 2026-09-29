@@ -127,6 +127,13 @@ make -C test/host check      # exit 0 == every check passed
   happens to sit across a 2 KB boundary in the linked kernel. A kernel static is physically contiguous,
   so nothing needs splitting; the counter exists for raw I/O from user pages, where the second page is
   not guaranteed to follow the first.
+- Stock Amix `init` behaviour, not the driver, but every IDE box will meet it: a run-level change requested
+  while **nobody is logged in on the console** (the console `getty` sits at `login:`, and `shutdown -i6`
+  comes over telnet) stops at `INIT: New run level: 6` and never spawns `/etc/rc6`. The disk keeps
+  working, `who -r` reports level 6, telnet still answers, and only a power cycle gets the box back.
+  The same happens with the stock kernel on an A3000 without this driver. Request reboots and halts
+  from a root shell logged in on the console (or leave one logged in); then `rc6` runs and the machine
+  reboots normally.
 - The stock disk driver `dd.c` completes a buffer (`iodone`) before it starts the next one, and the
   completion callback can resubmit the disk's single `sdcom` while the first submission is still on
   the cable or queued. `idequeue()` ignores such a duplicate (`ide_dup_submits` counts them); the
