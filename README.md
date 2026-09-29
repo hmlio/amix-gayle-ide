@@ -121,6 +121,12 @@ make -C test/host check      # exit 0 == every check passed
   `ide_resets` counts them), so a drive still executing the abandoned command cannot complete it into
   the next request's buffer. A drive that stays busy through the reset fails each request without
   hanging the kernel.
+- `ide_pagecross_n` counts raw requests (one page or less) whose buffer straddles a page boundary, and logs
+  the first. It fires once on every boot: the partition layer (`sdpart.c`) reads the RDB and partition
+  blocks 512 bytes at a time into a static kernel buffer (`block`, 512 bytes in the kernel's bss) that
+  happens to sit across a 2 KB boundary in the linked kernel. A kernel static is physically contiguous,
+  so nothing needs splitting; the counter exists for raw I/O from user pages, where the second page is
+  not guaranteed to follow the first.
 - The stock disk driver `dd.c` completes a buffer (`iodone`) before it starts the next one, and the
   completion callback can resubmit the disk's single `sdcom` while the first submission is still on
   the cable or queued. `idequeue()` ignores such a duplicate (`ide_dup_submits` counts them); the
