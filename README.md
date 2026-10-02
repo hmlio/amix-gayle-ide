@@ -46,14 +46,15 @@ login works. To my knowledge the first Amix boot on an A4000 with root on IDE.
   unpatched kernel. Emulation: 107k interrupts, 2 spurious, 0 timeouts; 10 MB raw read 3.4 s → 0.7 s sys.
 - ✅ **Native build** — compiles with the Amix K&R `cc` without diagnostics, links `checkunix`-clean
   through amix-kerntools, boots on an A3000 profile (probe silent) and the Amiberry A4000/AGA profile.
-- ✅ **Host harness** — the unmodified driver source against a mock Gayle/ATA model, 787 checks.
+- ✅ **Host harness** — the unmodified driver source against a mock Gayle/ATA model, built twice:
+  the 68030 object (811 checks) and the 68040/68060 one (1046 checks, cache and ordering included).
 - 🟡 **Board table** — A4000 entry proven; A1200/A600 entries (task file `0xDA0000`, latched INTREQ,
   Gayle ID register) follow NetBSD/Amiberry and are untested. They are never auto-detected: select
   one with `ide_board_force` (2 = A1200, 3 = A600), which is the only time the Gayle ID register at
   `0xDE1000` is read. Amix itself has further A1200/A600 blockers (fast RAM expected at `0x07000000`).
 - 🟡 **Open on real hardware** — stress and power-cycle `fsck` runs, spin-count calibration of the
   bounded polled waits, the installer route, and cache inhibition of the register ranges (assumed from the stock kernel's
-  transparent-translation setup). These are the `[verify]` markers left in `src/ide.c`. The **IDE
+  transparent-translation setup on the 68030; checked at attach on the 68040/68060 line). These are the `[verify]` markers left in `src/ide.c`. The **IDE
   slave** stays disabled unless `ide_slave_enable` is set.
 
 The IDE master is presented as **SCSI unit 6** (`ide_master_unit`) so that the stock root configuration
@@ -100,7 +101,7 @@ no `unix_boot` patches (68030 = stock `unix_boot` 1.1c).
 The host harness needs only a C compiler:
 
 ```sh
-make -C test/host check      # exit 0 == every check passed
+make -C test/host check      # both variants; exit 0 == every check passed
 ```
 
 ## Hardware notes
@@ -140,6 +141,34 @@ make -C test/host check      # exit 0 == every check passed
   request completes once, from its first submission. The amigaux.org build hub additionally applies
   `amix-z3660scsi`'s `dd.c` ordering patch (start the next buffer, then `iodone`) to its IDE kernels;
   on a stock `dd.c` the guard alone keeps the queue sane.
+
+## The 68040/68060 kernel line
+
+The same `src/ide.c` builds for the 68040/68060 Amix line (amix-040-060-port), whose relink pass
+compiles it with `-m68040 -DIDE_NBPP=4096 -DIDE_CACHE=1` and registers the port itself. Without
+`IDE_CACHE` none of the following is in the object except the spin high-water counter.
+
+- **Interrupts: polled only.** The line's `int2_tbl[]` is a fixed table that the relink pass cannot
+  grow, so `ideintr` is never in it. Attach finds no hook, keeps the drive's nIEN set and runs every
+  command polled inside the queue routine (`ide: A4000 IDE, polled I/O` on the console). A transfer
+  holds IPL 2 while it runs (an 8 KB block is 16 sectors of PIO), so the clock tick waits behind it,
+  and a drive slow to come ready holds IPL 2 for up to the spin budget.
+- **Data cache.** The CPU copies the sectors through the cache-inhibited identity alias, while the
+  same physical page may sit in the copyback data cache under a user mapping. Every buffer is pushed
+  and invalidated (`CPUSHL` + `CINVL` per 16-byte line, by physical address) before the transfer, and a
+  READ's buffer again after it. `ide_cache` (kmem, default 1) set to 0 skips the line operations for
+  an A/B run; `ide_push_n` / `ide_push_bytes` count them.
+- **Register cache inhibition** is checked at attach from DTT0/DTT1: `ide_ci_ok` is 1 when the task
+  file and IRQ mirror are reached cache-inhibited, 2 (with a console line) when they are not.
+- **Ordering.** The registers are cache-inhibited *nonserialized*; a `nop` before every task-file read
+  keeps it behind earlier writes once the 68060 store buffer is enabled.
+- **Page size** 4096 for the page-crossing counter (`ide_pagecross_n`).
+- **Spin budgets** ×4 (`IDE_SPIN_SCALE`): the polled loop is bound by the motherboard bus cycle, not the
+  CPU, so the same counts would run out sooner only by the loop overhead. `ide_spins_hw` records the
+  longest successful wait, for calibration on the machine.
+
+Where the port sits in card order beside the Z3660's SCSI is the relink pass's decision, not the
+driver's.
 
 ## Sharing a kernel with a SCSI host adapter
 

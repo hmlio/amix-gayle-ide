@@ -5,7 +5,9 @@
  *          carries A1200/A600 rows: untested, reachable only by ide_board_force.)
  *
  * Phase 2: interrupt-driven READ/WRITE (level 2, via int2_tbl[]) with a polled
- * fallback, PIO only, LBA28, master drive by default.
+ * fallback, PIO only, LBA28, master drive by default.  On the 68040/68060
+ * line (-DIDE_CACHE=1) the fallback is the only mode: int2_tbl[] there is a
+ * fixed table without ideintr (README, "The 68040/68060 kernel line").
  *
  * Copyright (c) 2026 Emre Bastuz.  See ../LICENSE.
  *
@@ -84,12 +86,13 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
  * described in the board table.
  *
  * Kernel virtual == physical for these ranges (sys/immu.h: phystokv(p) == p;
- * the low 1 GB is identity mapped through the 030 transparent translation
+ * the low 1 GB is identity mapped through the transparent translation
  * registers), so the driver dereferences plain addresses.  Cache inhibition
  * of these ranges on the 68030 is assumed from the transparent-translation
  * registers (works on the real A4000; the TT0/TT1 CI bits themselves are not
- * yet read back); the 68040/68060 line, with its copyback caches, needs
- * explicit handling that this driver does not have.
+ * yet read back); on the 68040/68060 line DTT0 (0x003fc060, pstart040.s)
+ * covers them cache-inhibited for supervisor data, which an IDE_CACHE build
+ * checks at attach (see "68040/68060 data cache" below).
  */
 /* Base addresses live in the board table (struct ideboard) -- never here. */
 #define IDE_SPAN	0x101BL		/* bytes from a task-file base to the last register + 1 */
@@ -227,10 +230,25 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
  * status read plus loop overhead; on a 25 MHz 68030 that is on the order of a
  * microsecond, so the defaults allow several seconds.  [verify] calibrate on
  * the real machine; plain globals so the kernel debugger can change them.
+ *
+ * The loop is bus bound: the status read is a motherboard cycle of fixed
+ * length whatever the CPU, and only the loop overhead shrinks on a faster
+ * one.  An IDE_CACHE (68040/68060) build therefore scales the budgets by
+ * IDE_SPIN_SCALE (4), which keeps the wall-clock floor at or above the 030's
+ * for any per-iteration speed-up up to 4x.  [verify] on metal: ide_spins_hw
+ * records the most iterations a successful wait has needed.
  */
-ulong	ide_spins       = 2000000L;	/* BSY/DRQ wait inside a polled command */
-ulong	ide_spins_reset = 8000000L;	/* BSY wait after reset / for FLUSH CACHE */
-ulong	ide_spins_short = 200000L;	/* DRQ wait inside the interrupt path */
+#ifndef IDE_SPIN_SCALE
+#if IDE_CACHE
+#define IDE_SPIN_SCALE	4L
+#else
+#define IDE_SPIN_SCALE	1L
+#endif
+#endif
+ulong	ide_spins       = 2000000L * IDE_SPIN_SCALE;	/* BSY/DRQ wait inside a polled command */
+ulong	ide_spins_reset = 8000000L * IDE_SPIN_SCALE;	/* BSY wait after reset / for FLUSH CACHE */
+ulong	ide_spins_short = 200000L * IDE_SPIN_SCALE;	/* DRQ wait inside the interrupt path */
+ulong	ide_spins_hw;			/* high-water: iterations a successful wait needed */
 
 int	ide_slave_enable = 0;		/* 0: never touch the slave (FlashAir rule) */
 int	ide_intr_enable  = 1;		/* 0: force polled I/O even if hooked */
@@ -268,6 +286,162 @@ ulong	ide_pagecross_n;		/* raw (<= IDE_NBPP) requests spanning two pages */
 #define RW( a)		(*(volatile ushort *)(a))
 #define WW( a, v)	(*(volatile ushort *)(a) = (ushort)(v))
 #endif
+
+/* -------------------------------------------- 68040/68060 data cache */
+
+/*
+ * Built only with -DIDE_CACHE=1, for the 68040/68060 kernel line; the 68030
+ * object contains none of it.
+ *
+ * PIO is done by the CPU, but not through a cached alias: the driver stores
+ * and loads the buffer at cp->addr, a physical address dereferenced through
+ * the low identity range, which DTT0 makes cache-inhibited for supervisor
+ * data.  The same physical page can sit in the copyback data cache under
+ * another alias -- a raw-I/O buffer is a user page, and user pages are
+ * copyback on this line.  A WRITE would then send RAM that is older than the
+ * dirty line, and a READ would leave stale lines that are later read, or
+ * evicted over the fresh sectors.  So every buffer is pushed and invalidated
+ * (CPUSHL + CINVL, by physical line: one op covers every alias) before the
+ * transfer, and a READ's buffer again after it.  CINVL follows each CPUSHL
+ * because the 68060 leaves a pushed line valid when CACR.DPI is set.  The
+ * range rounds outward to 16-byte lines; push-before-invalidate never
+ * discards a neighbour's dirty bytes in the edge lines.  The same sequence as
+ * amix-z3660scsi (BLIZZARD F3), with the raw words verified there:
+ *   f468 = cpushl dc,(a0)   f448 = cinvl dc,(a0)   4e71 = nop
+ *   4e7a 0006 / 0007 / 0002 = movec dtt0 / dtt1 / cacr,d0
+ *
+ * Ordering: DTT0 is cache-inhibited NONSERIALIZED, so with the 68060 store
+ * buffer enabled a task-file read could overtake a buffered write (a status
+ * poll ahead of the COMMAND write that it is meant to follow).  TR() issues a
+ * NOP first, which waits for pending writes.  [verify] against the MC68060UM
+ * before the store buffer is turned on; with it off the NOP costs a few
+ * cycles next to a motherboard bus cycle.
+ *
+ * ide_cache (kmem) turns the line operations off for an A/B run; the NOP and
+ * the attach-time check stay.
+ */
+#if IDE_CACHE
+long	ide_cache = 1;			/* 0: no line operations (A/B only) */
+ulong	ide_push_n, ide_push_bytes;	/* push+invalidate passes, bytes covered */
+ulong	ide_dtt0, ide_dtt1, ide_cacr;	/* captured at attach */
+ulong	ide_ci_ok;			/* 0 not checked, 1 task file cache-inhibited, 2 NOT */
+
+#ifndef HOST_TEST
+#define IDE_CPUSHL( p)	__asm__ __volatile__( ".word 0xf468" : : "a" (p) : "memory")
+#define IDE_CINVL( p)	__asm__ __volatile__( ".word 0xf448" : : "a" (p) : "memory")
+#define IDE_SYNC()	__asm__ __volatile__( ".word 0x4e71" : : : "memory")
+#define IDE_LINEPTR	register uchar *p __asm__("a0")
+
+static ulong
+ide_rd_dtt0()
+{
+	register ulong	v __asm__("d0");
+
+	__asm__ __volatile__( ".word 0x4e7a,0x0006" : "=d" (v));
+	return v;
+}
+
+static ulong
+ide_rd_dtt1()
+{
+	register ulong	v __asm__("d0");
+
+	__asm__ __volatile__( ".word 0x4e7a,0x0007" : "=d" (v));
+	return v;
+}
+
+static ulong
+ide_rd_cacr()
+{
+	register ulong	v __asm__("d0");
+
+	__asm__ __volatile__( ".word 0x4e7a,0x0002" : "=d" (v));
+	return v;
+}
+#else	/* HOST_TEST: mock_regs.h routes IDE_CPUSHL/IDE_CINVL/IDE_SYNC and the
+	 * control-register reads into the harness */
+#define IDE_LINEPTR	uchar *p
+#define ide_rd_dtt0()	mock_dtt0
+#define ide_rd_dtt1()	mock_dtt1
+#define ide_rd_cacr()	mock_cacr
+#endif	/* HOST_TEST */
+
+/* Push and invalidate every data-cache line covering [pa, pa + len). */
+static void
+ide_cache_push( pa, len)
+ulong	pa, len;
+{
+	IDE_LINEPTR;
+	ulong	end;
+
+	if (ide_cache == 0 || pa == 0 || len == 0 || pa + len < pa)
+		return;
+	p   = (uchar *)(pa & ~15L);
+	end = (pa + len + 15) & ~15L;
+	while ((ulong)p < end) {
+		IDE_CPUSHL( p);
+		IDE_CINVL( p);
+		p += 16;
+	}
+	ide_push_n++;
+	ide_push_bytes += len;
+}
+
+/*
+ * Classify a transparent-translation register against one address for
+ * supervisor data: 0 does not cover it, 1 covers it cache-inhibited, 2 covers
+ * it cached.  Layout (040 and 060): 31-24 base, 23-16 mask, 15 E, 14-13 S,
+ * 6-5 CM (0 writethrough, 1 copyback, 2/3 cache-inhibited).
+ */
+static int
+ide_ttr_class( t, a)
+ulong	t, a;
+{
+	ulong	base, mask;
+
+	if ((t & 0x8000) == 0 || ((t >> 13) & 3) == 0)	/* disabled, or user only */
+		return 0;
+	base = (t >> 24) & 0xFF;
+	mask = (t >> 16) & 0xFF;
+	if ((((a >> 24) & 0xFF) & ~mask) != (base & ~mask))
+		return 0;
+	return ((t >> 5) & 3) >= 2 ? 1 : 2;
+}
+
+/*
+ * Attach-time check that the board's registers are reached cache-inhibited:
+ * a cached status register would never change.  Both ends of the span are
+ * tested (TTR granularity is 16 MB).  An address no TTR covers fails too: it
+ * would go through page tables whose cache mode the driver cannot see.  The
+ * driver carries on either way -- refusing the root disk would only hide the
+ * message -- but says so on the console.
+ */
+static void
+ide_ci_check( lo, hi)
+ulong	lo, hi;				/* lo inclusive, hi exclusive */
+{
+	ulong	a;
+	int	i, c0, c1;
+
+	ide_dtt0 = ide_rd_dtt0();
+	ide_dtt1 = ide_rd_dtt1();
+	ide_cacr = ide_rd_cacr();
+	ide_ci_ok = 1;
+	for (i = 0; i < 2; ++i) {
+		a  = i ? hi - 1 : lo;
+		c0 = ide_ttr_class( ide_dtt0, a);
+		c1 = ide_ttr_class( ide_dtt1, a);
+		if (c0 == 2 || c1 == 2 || (c0 == 0 && c1 == 0)) {
+			ide_ci_ok = 2;
+			printf( "ide: 0x%x is NOT cache-inhibited (dtt0 0x%x dtt1 0x%x cacr 0x%x)\n",
+				(int)a, (int)ide_dtt0, (int)ide_dtt1, (int)ide_cacr);
+		}
+	}
+}
+#else	/* !IDE_CACHE: the 68030 line has no copyback data cache to maintain */
+#define IDE_SYNC()
+#define ide_cache_push( pa, len)
+#endif	/* IDE_CACHE */
 
 /* ------------------------------------------------------------ boards */
 
@@ -310,7 +484,18 @@ static struct ideboard	ideboards[] = {
 static struct ideboard	*ide_bd;	/* the detected board, NULL until then */
 
 /* task-file access relative to the board base */
+#if IDE_CACHE
+static __inline__ int
+ide_tr( o)
+ulong	o;
+{
+	IDE_SYNC();			/* earlier task-file writes land first */
+	return RB( ide_bd->base + o);
+}
+#define TR( o)		ide_tr( (ulong)(o))
+#else
 #define TR( o)		RB( ide_bd->base + (o))
+#endif
 #define TW( o, v)	WB( ide_bd->base + (o), (v))
 #define TRW()		RW( ide_bd->base + IDE_REG_DATA)
 #define TWW( v)		WW( ide_bd->base + IDE_REG_DATA, (v))
@@ -403,10 +588,16 @@ ulong	spins;
 {
 	int	st;
 
+	ulong	n;
+
+	n = spins;
 	do {
 		st = TR( IDE_REG_STATUS);
-		if ((st & mask) == want)
+		if ((st & mask) == want) {
+			if (n - spins > ide_spins_hw)
+				ide_spins_hw = n - spins;
 			return st;
+		}
 	} while (spins-- != 0);
 	return -1;
 }
@@ -417,11 +608,16 @@ ide_wait_drq( spins)
 ulong	spins;
 {
 	int	st;
+	ulong	n;
 
+	n = spins;
 	do {
 		st = TR( IDE_REG_STATUS);
-		if (!(st & IDE_ST_BSY) && (st & (IDE_ST_DRQ | IDE_ST_ERR | IDE_ST_DF)))
+		if (!(st & IDE_ST_BSY) && (st & (IDE_ST_DRQ | IDE_ST_ERR | IDE_ST_DF))) {
+			if (n - spins > ide_spins_hw)
+				ide_spins_hw = n - spins;
 			return st;
+		}
 	} while (spins-- != 0);
 	return -1;
 }
@@ -555,6 +751,13 @@ ushort	*id;
 	return 0;
 }
 
+/*
+ * Sectors per MB for the attach banner.  A variable, not the constant 2048:
+ * the 68040/68060 relink pass rejects any shift by 11 (the 030 page shift)
+ * in a linked object, and /2048 compiles to exactly that.
+ */
+static ulong	ide_secs_per_mb = 1048576L / IDE_SECTOR;
+
 static void
 ide_attach_unit( drive)
 int	drive;
@@ -591,7 +794,7 @@ int	drive;
 		*--m = '\0';
 	u->present = TRUE;
 	printf( "ide%d: %s, %d sectors (%d MB)\n", drive, u->model,
-		(int)u->nsectors, (int)(u->nsectors / 2048));
+		(int)u->nsectors, (int)(u->nsectors / ide_secs_per_mb));
 }
 
 /* Is ideintr in the kernel's level-2 table?  (NULL-terminated, kernel.c.) */
@@ -614,6 +817,9 @@ ide_attach()
 
 	ide_attached = 1;
 	ide_use_intr = 0;
+#if IDE_CACHE
+	ide_ci_check( ide_bd->base, ide_bd->base + IDE_SPAN);
+#endif
 	TW( IDE_REG_CONTROL, IDE_CTL_NIEN);		/* quiet during the polled attach */
 	for (drive = 0; drive < IDE_NDRIVES; ++drive)
 		if (drive == 0 || ide_slave_enable)
@@ -955,6 +1161,8 @@ int	err;
 	ide_active = 0;
 	ide_watch_ticks = 0;
 	if (cp) {
+		if (!ide_x.write && !ide_x.nodata)
+			ide_cache_push( (ulong)cp->addr, (ulong)cp->nbyte);	/* lines refetched meanwhile */
 		cp->status = err ? SC_CHECK : SC_GOOD;
 		cp->okay   = TRUE;
 		ide_complete( cp);		/* may re-enter idequeue(): it just enqueues */
@@ -1202,6 +1410,7 @@ struct sdcom	*cp;
 	}
 	if (ide_state == 2 && !ide_attached)
 		ide_attach();
+	ide_cache_push( (ulong)cp->addr, (ulong)cp->nbyte);	/* before the CPU reads or fills it */
 
 	drive = ide_drive_of( cp->unit);
 	data  = (uchar *)cp->addr;
@@ -1387,6 +1596,8 @@ struct sdcom	*cp;
 		}
 		if (ide_rw_polled( u, drive, write, lba, nblk, data, (ulong)cp->nbyte) < 0)
 			cp->status = SC_CHECK;
+		if (!write)
+			ide_cache_push( (ulong)data, (ulong)cp->nbyte);
 		break;
 
 	default:
