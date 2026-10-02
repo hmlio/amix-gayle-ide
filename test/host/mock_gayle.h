@@ -39,7 +39,18 @@ struct mock_drive {
 	int		hung;		/* status BSY, no INTRQ, until a software reset */
 	int		hang_on_cmd;	/* accept the next READ/WRITE, then go `hung' */
 	int		mute_intrq;	/* never assert INTRQ (interrupt lost) */
+	/* ATAPI CD-ROM (mock_add_cdrom) */
+	int		atapi;
+	int		pkt16;		/* 16-byte command packets */
+	unsigned long	cd_blocks;	/* 2048-byte blocks on the disc */
+	unsigned char	*cd;
+	int		no_medium;	/* TUR/READ/READ CAPACITY: NOT READY, 3A */
+	unsigned	chunk;		/* bytes per DRQ phase (0: the host's byte count limit) */
+	unsigned char	skey, asc;	/* sense held for REQUEST SENSE */
+	int		hang_on_pkt;	/* accept the next packet, then stay BSY until SRST */
 };
+
+#define MOCK_CD_BLOCK	2048
 
 extern struct mock_drive	mock_drv[2];
 extern int			mock_board;
@@ -77,7 +88,16 @@ extern struct mock_lineop	mock_lineops[MOCK_LINEOPS];
 extern int			mock_nlineops;
 extern unsigned long		mock_lineops_lost;
 
+/* ATAPI: the packets the drive executed, the last byte count limit, MODE SELECT data */
+extern unsigned char		mock_pkt_log[64];	/* opcodes in order */
+extern int			mock_pkt_log_n;
+extern unsigned			mock_pkt_bc;		/* byte count limit of the last PACKET */
+extern unsigned char		mock_pkt_last[16];	/* the last packet as received */
+extern unsigned char		mock_atapi_out[256];	/* data-out bytes of the last command */
+extern unsigned			mock_atapi_out_n;
+
 void mock_reset();
+void mock_add_cdrom();			/* (unit, blocks, model) */
 void mock_add_drive();			/* (unit, nsectors, model, flush) */
 void mock_free();
 unsigned long mock_cmds();		/* total commands issued */

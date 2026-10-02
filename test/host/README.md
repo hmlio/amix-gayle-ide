@@ -57,3 +57,12 @@ bracket is balanced) and a `printf()` that records the driver's console output.
 - Completion: delivered exactly once per request, iteratively (a request issued from
   inside the completion does not nest), spl bracket balanced, FIFO never overflows.
 - CHS-only drives are refused with a console message.
+- ATAPI CD-ROM (`mock_add_cdrom`: signature, IDENTIFY PACKET, PACKET with CoD/IO phases of the
+  host's byte count or a forced chunk, sense held for REQUEST SENSE, no DRDY): attach per slave mode
+  0/1/2, the cdfs mount sequence, multi-phase and odd-length transfers, the overrun drain, the
+  drive's sense vs the driver's own, READ(6) → READ(10), CDB tail zeroing, data out, 16-byte
+  packets, a hung drive (polled budget and watchdog, SRST), CD and CF requests queued together.
+- The 68040/68060 build (`-DIDE_CACHE=1 -DIDE_NBPP=4096`, `ide_test_040`): every buffer line pushed
+  and invalidated before the transfer and a read's again after it, nothing outside the buffer, the
+  TTR cache-inhibit check on five DTT shapes, no task-file read ahead of an unsynchronised write
+  (asserted after every request), the ×4 spin budgets.

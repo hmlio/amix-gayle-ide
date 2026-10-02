@@ -41,13 +41,18 @@ login works. To my knowledge the first Amix boot on an A4000 with root on IDE.
   READ CAPACITY(10), MODE SENSE(6), START/STOP UNIT, SYNCHRONIZE CACHE, VERIFY(10) → ATA READ/WRITE
   SECTOR(S), IDENTIFY DEVICE, FLUSH CACHE, READ VERIFY SECTOR(S), with synthesised sense data. PIO
   only, LBA28, LUN 0 only.
+- 🟡 **ATAPI CD-ROM** — an ATAPI device (detected by its signature, then IDENTIFY PACKET DEVICE) gets
+  the caller's CDBs as PACKET commands: INQUIRY, READ CAPACITY, READ(10), REQUEST SENSE are the
+  drive's own answers, so a cdfs-capable kernel mounts it like a SCSI CD-ROM (see Hardware notes).
+  Host harness and Amiberry (68030 and 68060); not yet on real hardware.
 - ✅ **Interrupt-driven I/O** `ideintr()` — level-2 handler hooked into `int2_tbl[]` by
   `kernel.c.patch`, one interrupt per sector, `timeout()` watchdog; falls back to polled I/O on an
   unpatched kernel. Emulation: 107k interrupts, 2 spurious, 0 timeouts; 10 MB raw read 3.4 s → 0.7 s sys.
 - ✅ **Native build** — compiles with the Amix K&R `cc` without diagnostics, links `checkunix`-clean
   through amix-kerntools, boots on an A3000 profile (probe silent) and the Amiberry A4000/AGA profile.
-- ✅ **Host harness** — the unmodified driver source against a mock Gayle/ATA model, built twice:
-  the 68030 object (811 checks) and the 68040/68060 one (1046 checks, cache and ordering included).
+- ✅ **Host harness** — the unmodified driver source against a mock Gayle/ATA model with an ATAPI
+  CD-ROM, built twice: the 68030 object (1197 checks) and the 68040/68060 one (1511 checks, cache
+  and ordering included).
 - 🟡 **Board table** — A4000 entry proven; A1200/A600 entries (task file `0xDA0000`, latched INTREQ,
   Gayle ID register) follow NetBSD/Amiberry and are untested. They are never auto-detected: select
   one with `ide_board_force` (2 = A1200, 3 = A600), which is the only time the Gayle ID register at
@@ -56,7 +61,8 @@ login works. To my knowledge the first Amix boot on an A4000 with root on IDE.
   bounded polled waits, the installer route, and cache inhibition of the register ranges (assumed from the stock kernel's
   transparent-translation setup on the 68030; checked at attach on the 68040/68060 line, where a
   real 68060 passes). These are the `[verify]` markers left in `src/ide.c`. The **IDE
-  slave** stays disabled unless `ide_slave_enable` is set.
+  slave** stays untouched unless `ide_slave_enable` is set: 1 attaches whatever answers there, 2
+  attaches it only if it is an ATAPI device (the CD-ROM next to a CF master).
 
 The IDE master is presented as **SCSI unit 6** (`ide_master_unit`) so that the stock root configuration
 `c6d0s1`, `/etc/vfstab` and the installer's assumptions of an A3000-installed system apply unchanged.
@@ -129,6 +135,17 @@ make -C test/host check      # both variants; exit 0 == every check passed
   happens to sit across a 2 KB boundary in the linked kernel. A kernel static is physically contiguous,
   so nothing needs splitting; the counter exists for raw I/O from user pages, where the second page is
   not guaranteed to follow the first.
+- **ATAPI CD-ROM.** On the slave with `ide_slave_enable` 2 (or 1) it is SCSI unit 5 of the IDE
+  card; with a cdfs-capable kernel, `mount -F cdfs <card>,5 /cdrom` mounts it (card 0 where the IDE
+  port is the only controller, card 1 below the Z3660 on the 68040/68060 line). Every CDB
+  goes to the drive as a 12- (or 16-) byte packet; only READ(6)/WRITE(6), which MMC drives lack,
+  become READ(10)/WRITE(10). A CHECK CONDITION leaves the drive's own sense for the next REQUEST
+  SENSE, which goes to the drive too, unless the driver itself raised the condition (no such LUN,
+  timeout). The data moves in the DRQ phases the drive chooses; bytes beyond the caller's `nbyte`
+  are drained, not stored (`ide_atapi_overrun` counts them), so a 512-byte `dd.c` read of a
+  2048-byte CD block cannot overrun its buffer. `/dev/dsk` is not the way to a CD: `dd.c` expects
+  512-byte blocks and an RDB. Polled ATAPI waits allow `ide_spins_atapi` iterations per phase (a
+  disc spinning up); interrupt-driven ones are bounded by the `ide_timeout_secs` watchdog.
 - Stock Amix `init` behaviour, not the driver, but every IDE box will meet it: a run-level change requested
   while **nobody is logged in on the console** (the console `getty` sits at `login:`, and `shutdown -i6`
   comes over telnet) stops at `INIT: New run level: 6` and never spawns `/etc/rc6`. The disk keeps

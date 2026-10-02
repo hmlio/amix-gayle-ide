@@ -28,7 +28,7 @@ extern unsigned long	ide_intr_count, ide_intr_spurious, ide_intr_timeouts, ide_t
 extern unsigned long	ide_dup_submits, ide_resets, ide_pagecross_n, ide_intr_busy;
 extern int	ide_slave_enable, ide_debug, ide_master_unit, ide_slave_unit;
 extern int	ide_intr_enable, ide_board_force;
-extern unsigned long	ide_spins_hw;
+extern unsigned long	ide_spins_hw, ide_atapi_cmds, ide_atapi_overrun, ide_spins_atapi;
 #if IDE_CACHE
 extern long	ide_cache;
 extern unsigned long	ide_push_n, ide_ci_ok;
@@ -1450,6 +1450,354 @@ test_cache_synth_and_off()
 }
 #endif	/* IDE_CACHE */
 
+/* ---------------------------------------------------------------- ATAPI */
+
+#define CD_BLOCKS	64
+
+/* CF master + ATAPI CD-ROM slave, slave mode `mode' (0/1/2), interrupt or polled */
+static void
+fresh_cd( mode, polled)
+int	mode, polled;
+{
+	fresh( 1);
+	mock_add_cdrom( 1, (unsigned long)CD_BLOCKS, "MOCK CD-ROM DRIVE");
+	ide_slave_enable = mode;
+	if (polled)
+		int2_tbl[0] = 0;
+}
+
+static int
+cd_equals( lba, buf, nbyte)
+unsigned long	lba;
+const char	*buf;
+unsigned	nbyte;
+{
+	return memcmp( mock_drv[1].cd + lba * MOCK_CD_BLOCK, buf, nbyte) == 0;
+}
+
+static void
+cdb10( cdb, op, lba, n)
+unsigned char	*cdb;
+int		op, n;
+unsigned long	lba;
+{
+	memset( cdb, 0, 12);
+	cdb[0] = op;
+	cdb[2] = lba >> 24; cdb[3] = lba >> 16; cdb[4] = lba >> 8; cdb[5] = lba;
+	cdb[7] = n >> 8; cdb[8] = n;
+}
+
+static void
+test_atapi_attach()
+{
+	struct sdcom	cp;
+	unsigned char	cdb[6] = { 0, 0, 0, 0, 0, 0 };
+
+	fresh_cd( 2, 0);
+	tur( &cp, 6);
+	CHECK( strstr( mock_console, "ide1: MOCK CD-ROM DRIVE, ATAPI CD-ROM") != 0, "ATAPI slave attached and named");
+	CHECK( mock_cmd_count[0xEC] == 2 && mock_cmd_count[0xA1] == 1, "IDENTIFY on both, IDENTIFY PACKET on the CD");
+	CHECK( strstr( mock_console, "ide0: MOCK CF CARD 2GB") != 0, "master attached as before");
+	run( &cp, 5, cdb, 6, 0, 0);
+	CHECK( cp.okay && cp.status == 0, "TUR to the CD: GOOD");
+	CHECK( mock_pkt_log_n == 1 && mock_pkt_log[0] == 0x00, "TUR went to the drive as a packet");
+
+	fresh_cd( 0, 0);				/* the CF kit's setting: never touch the slave */
+	tur( &cp, 6);
+	CHECK( mock_slave_selects == 0 && mock_cmd_count[0xA1] == 0, "slave mode 0: the CD is never touched");
+	run( &cp, 5, cdb, 6, 0, 0);
+	CHECK( !cp.okay && mock_slave_selects == 0, "slave mode 0: unit 5 is no device");
+
+	fresh_cd( 1, 0);
+	run( &cp, 5, cdb, 6, 0, 0);
+	CHECK( cp.okay && cp.status == 0, "slave mode 1 attaches the CD too");
+
+	fresh( 2);					/* ATA slave, ATAPI-only mode */
+	ide_slave_enable = 2;
+	tur( &cp, 6);
+	CHECK( strstr( mock_console, "ATA device on the slave ignored") != 0, "slave mode 2 refuses an ATA slave, says so");
+	run( &cp, 5, cdb, 6, 0, 0);
+	CHECK( !cp.okay, "and unit 5 stays no device");
+	tur( &cp, 6);
+	CHECK( cp.okay && cp.status == 0, "master unaffected");
+
+	fresh( 0);					/* the CD as master, nothing else */
+	mock_add_cdrom( 0, (unsigned long)CD_BLOCKS, "MOCK CD MASTER");
+	run( &cp, 6, cdb, 6, 0, 0);
+	CHECK( cp.okay && cp.status == 0, "ATAPI master: unit 6 TUR GOOD");
+	CHECK( strstr( mock_console, "ide0: MOCK CD MASTER, ATAPI CD-ROM") != 0, "ATAPI master attached");
+}
+
+/* the cdfs mount sequence: INQUIRY, READ CAPACITY(10), READ(10) of one 2048-byte block */
+static void
+atapi_cdfs_case( polled)
+int	polled;
+{
+	struct sdcom	cp;
+	static char	buf[3 * 2048];
+	char		*b = buf + 2048 - ((unsigned long)buf & 2047);	/* 2 KB aligned */
+	unsigned char	cdb[12];
+	unsigned long	c0;
+
+	fresh_cd( 2, polled);
+	tur( &cp, 6);
+	c0 = ide_atapi_cmds;
+	memset( cdb, 0, 12); cdb[0] = 0x12; cdb[4] = 36;
+	memset( b, 0xEE, 64);
+	run( &cp, 5, cdb, 6, b, 36);
+	CHECK( cp.okay && cp.status == 0, "INQUIRY: GOOD");
+	CHECK( (b[0] & 0x1F) == 5 && memcmp( b + 8, "MOCK    ", 8) == 0, "INQUIRY is the drive's own: type 5");
+	CHECK( (unsigned char)b[36] == 0xEE, "INQUIRY: nothing stored past nbyte");
+	CHECK( mock_pkt_bc == 36, "byte count limit = nbyte");
+	cdb10( cdb, 0x25, 0L, 0);
+	run( &cp, 5, cdb, 10, b, 8);
+	CHECK( cp.okay && cp.status == 0, "READ CAPACITY: GOOD");
+	CHECK( (unsigned char)b[3] == CD_BLOCKS - 1 && (unsigned char)b[6] == 0x08 && b[7] == 0, "READ CAPACITY: last LBA, 2048-byte blocks");
+	cdb10( cdb, 0x28, 16L, 1);
+	run( &cp, 5, cdb, 10, b, 2048);
+	CHECK( cp.okay && cp.status == 0 && cd_equals( 16L, b, 2048), "READ(10) of the PVD block");
+	CHECK( memcmp( mock_pkt_last, cdb, 10) == 0 && mock_pkt_last[10] == 0 && mock_pkt_last[11] == 0, "the packet is the CDB");
+	CHECK( ide_atapi_cmds - c0 == 3, "three packet commands");
+#if IDE_CACHE
+	mock_nlineops = 0;
+	mock_data_first = mock_data_last = 0;
+	cdb10( cdb, 0x28, 17L, 1);
+	run( &cp, 5, cdb, 10, b, 2048);
+	CHECK( cp.okay && cp.status == 0 && cd_equals( 17L, b, 2048), "cache build: CD block read");
+	CHECK( lines_done( (unsigned long)b, 2048UL, 0UL, mock_data_first), "CD read: lines pushed before the transfer");
+	CHECK( lines_done( (unsigned long)b, 2048UL, mock_data_last, ~0UL), "CD read: and again after it");
+	CHECK( lines_only( (unsigned long)b, 2048UL), "CD read: only the buffer's lines");
+#endif
+	tur( &cp, 6);
+	read10( &cp, 6, 7L, 2, buf, 1024);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 7L, buf, 1024), "the CF master still reads");
+}
+
+static void
+test_atapi_cdfs_sequence()
+{
+	atapi_cdfs_case( 0);
+	atapi_cdfs_case( 1);
+}
+
+/* several DRQ phases (the drive moves 512 bytes per phase), odd lengths, overrun */
+static void
+atapi_phases_case( polled)
+int	polled;
+{
+	struct sdcom	cp;
+	static char	buf[5 * 2048];
+	unsigned char	cdb[12];
+	unsigned long	ov;
+
+	fresh_cd( 2, polled);
+	mock_drv[1].chunk = 512;
+	cdb10( cdb, 0x28, 3L, 4);
+	run( &cp, 5, cdb, 10, buf, 4 * 2048);
+	CHECK( cp.okay && cp.status == 0 && cd_equals( 3L, buf, 4 * 2048), "8 KB read in 16 DRQ phases");
+	if (!polled)
+		CHECK( ide_intr_count >= 17, "interrupt mode: one interrupt per phase plus the end");
+
+	mock_drv[1].chunk = 0;
+	memset( cdb, 0, 12); cdb[0] = 0x12; cdb[4] = 35;	/* odd allocation length */
+	memset( buf, 0xEE, 64);
+	ov = ide_atapi_overrun;
+	run( &cp, 5, cdb, 6, buf, 35);
+	CHECK( ide_atapi_overrun == ov, "odd length: no phantom overrun byte");
+	CHECK( cp.okay && cp.status == 0 && (buf[0] & 0x1F) == 5, "odd-length INQUIRY");
+	CHECK( memcmp( buf + 32, "1.0", 3) == 0 && (unsigned char)buf[35] == 0xEE, "odd length: 35 bytes stored, byte 35 untouched");
+
+	ov = ide_atapi_overrun;
+	memset( buf, 0xEE, 2048 + 16);
+	cdb10( cdb, 0x28, 9L, 1);
+	run( &cp, 5, cdb, 10, buf, 512);			/* a 512-byte caller on a 2048-byte block */
+	CHECK( cp.okay && cp.status == 0 && cd_equals( 9L, buf, 512), "short buffer: the first 512 bytes stored");
+	CHECK( (unsigned char)buf[512] == 0xEE && (unsigned char)buf[2047] == 0xEE, "short buffer: nothing stored past nbyte");
+	CHECK( ide_atapi_overrun - ov == 1536, "short buffer: 1536 bytes drained and counted");
+	tur( &cp, 6);
+	CHECK( cp.okay && cp.status == 0, "cable sane after the drain");
+}
+
+static void
+test_atapi_phases()
+{
+	atapi_phases_case( 0);
+	atapi_phases_case( 1);
+}
+
+/* CHECK CONDITION: the drive's sense is fetched by a REQUEST SENSE that goes to
+ * the drive; a sense the driver synthesised is answered first and locally */
+static void
+atapi_sense_case( polled)
+int	polled;
+{
+	struct sdcom	cp;
+	unsigned char	cdb[12], sense[18];
+
+	fresh_cd( 2, polled);
+	mock_drv[1].no_medium = 1;
+	memset( cdb, 0, 12);
+	run( &cp, 5, cdb, 6, 0, 0);
+	CHECK( cp.okay && cp.status == 0x02, "no disc: TUR CHECK CONDITION");
+	mock_pkt_log_n = 0;
+	reqsense( &cp, 5, sense);
+	CHECK( cp.okay && cp.status == 0 && sense[2] == 0x02 && sense[12] == 0x3A, "REQUEST SENSE: the drive's NOT READY / medium not present");
+	CHECK( mock_pkt_log_n == 1 && mock_pkt_log[0] == 0x03, "REQUEST SENSE went to the drive");
+
+	cdb10( cdb, 0x28, 0L, 1);
+	cdb[1] = 0x20;						/* LUN 1 */
+	run( &cp, 5, cdb, 10, 0, 0);
+	CHECK( cp.okay && cp.status == 0x02, "LUN 1: CHECK from the driver");
+	mock_pkt_log_n = 0;
+	reqsense( &cp, 5, sense);
+	CHECK( sense[2] == 0x05 && sense[12] == 0x25 && mock_pkt_log_n == 0, "the driver's own sense answered locally first");
+	reqsense( &cp, 5, sense);
+	CHECK( mock_pkt_log_n == 1, "the next REQUEST SENSE goes to the drive again");
+
+	mock_drv[1].no_medium = 0;
+	memset( cdb, 0, 12); cdb[0] = 0xBE;			/* an opcode the mock drive does not know */
+	run( &cp, 5, cdb, 12, 0, 0);
+	CHECK( cp.okay && cp.status == 0x02, "unknown opcode: the drive's CHECK");
+	reqsense( &cp, 5, sense);
+	CHECK( sense[2] == 0x05 && sense[12] == 0x20, "and the drive's ILLEGAL REQUEST / invalid opcode");
+	mock_drv[1].unc_lba = 20;
+	cdb10( cdb, 0x28, 19L, 2);
+	run( &cp, 5, cdb, 10, (char *)sense, 18);
+	CHECK( cp.okay && cp.status == 0x02, "medium error on the disc: CHECK");
+	reqsense( &cp, 5, sense);
+	CHECK( sense[2] == 0x03 && sense[12] == 0x11, "MEDIUM ERROR / unrecovered read error");
+}
+
+static void
+test_atapi_sense()
+{
+	atapi_sense_case( 0);
+	atapi_sense_case( 1);
+}
+
+/* READ(6) becomes READ(10); a CDB's tail is not sent; data out; 16-byte packets */
+static void
+test_atapi_packets()
+{
+	struct sdcom	cp;
+	static char	buf[2 * 2048];
+	unsigned char	cdb[12], out[12];
+	int		i;
+
+	fresh_cd( 2, 0);
+	memset( cdb, 0, 12); cdb[0] = 0x08; cdb[2] = 0; cdb[3] = 5; cdb[4] = 2;	/* READ(6) LBA 5, 2 blocks */
+	run( &cp, 5, cdb, 6, buf, 4096);
+	CHECK( cp.okay && cp.status == 0 && cd_equals( 5L, buf, 4096), "READ(6) served");
+	CHECK( mock_pkt_last[0] == 0x28 && mock_pkt_last[5] == 5 && mock_pkt_last[8] == 2, "READ(6) sent as READ(10)");
+
+	cdb10( cdb, 0x28, 6L, 1);
+	cdb[10] = 0x5A; cdb[11] = 0xA5;				/* junk after a 10-byte CDB */
+	run( &cp, 5, cdb, 12, buf, 2048);
+	CHECK( cp.okay && cp.status == 0 && mock_pkt_last[10] == 0 && mock_pkt_last[11] == 0, "bytes past the 10-byte CDB sent as zero");
+
+	for (i = 0; i < 12; ++i)
+		out[i] = (unsigned char)(0x30 + i);
+	memset( cdb, 0, 12); cdb[0] = 0x55; cdb[8] = 12;		/* MODE SELECT(10), 12 bytes out */
+	run( &cp, 5, cdb, 10, (char *)out, 12);
+	CHECK( cp.okay && cp.status == 0 && mock_atapi_out_n == 12 && memcmp( mock_atapi_out, out, 12) == 0, "data-out phase delivered");
+
+	fresh_cd( 2, 1);
+	mock_drv[1].pkt16 = 1;
+	cdb10( cdb, 0x28, 30L, 1);
+	run( &cp, 5, cdb, 10, buf, 2048);
+	CHECK( cp.okay && cp.status == 0 && cd_equals( 30L, buf, 2048), "16-byte packet device");
+}
+
+/* a drive that never finishes: polled spin budget / interrupt watchdog, SRST */
+static void
+test_atapi_timeout()
+{
+	struct sdcom	cp;
+	static char	buf[2048];
+	unsigned char	cdb[12], sense[18];
+	unsigned long	r0, i;
+
+	fresh_cd( 2, 1);
+	ide_spins_atapi = 2000;
+	tur( &cp, 6);
+	r0 = ide_resets;
+	mock_drv[1].hang_on_pkt = 1;
+	cdb10( cdb, 0x28, 1L, 1);
+	run( &cp, 5, cdb, 10, buf, 2048);
+	CHECK( cp.okay && cp.status == 0x02 && ide_resets == r0 + 1, "polled: hung CD fails the request and resets the cable");
+	reqsense( &cp, 5, sense);
+	CHECK( sense[2] == 0x04 && sense[12] == 0x08, "polled: HARDWARE ERROR / LU communication failure");
+	run( &cp, 5, cdb, 10, buf, 2048);
+	CHECK( cp.okay && cp.status == 0 && cd_equals( 1L, buf, 2048), "polled: CD usable after the reset");
+	tur( &cp, 6);
+	CHECK( cp.okay && cp.status == 0, "polled: master usable after the reset");
+
+	fresh_cd( 2, 0);
+	tur( &cp, 6);
+	r0 = ide_resets;
+	mock_drv[1].hang_on_pkt = 1;
+	memset( &cp, 0, sizeof cp);
+	cdb10( cp.cdb, 0x28, 1L, 1);
+	cp.addr = buf; cp.nbyte = 2048; cp.unit = 5; cp.intr = done;
+	intr_calls = 0;
+	idequeue( 0, &cp);
+	for (i = 0; i <= ide_timeout_secs && intr_calls == 0; ++i)
+		mock_fire_timeouts();
+	CHECK( intr_calls == 1 && cp.okay && cp.status == 0x02, "interrupt mode: the watchdog fails the hung CD request");
+	CHECK( ide_resets == r0 + 1, "interrupt mode: cable reset");
+	cdb10( cdb, 0x28, 2L, 1);
+	run( &cp, 5, cdb, 10, buf, 2048);
+	CHECK( cp.okay && cp.status == 0 && cd_equals( 2L, buf, 2048), "interrupt mode: CD usable after the reset");
+	ide_spins_atapi = 20000000L;
+}
+
+/* interrupt mode: CF and CD requests queued together complete in order, each once */
+static struct sdcom	aq[4];
+static int		aq_order[4], aq_n;
+
+static void
+aq_done( cp)
+struct sdcom	*cp;
+{
+	intr_calls++;
+	if (aq_n < 4)
+		aq_order[aq_n++] = (int)(cp - aq);
+}
+
+static void
+test_atapi_queue_with_disk()
+{
+	struct sdcom		*q = aq;
+	static char		b[4][2048];
+	int			i;
+
+	fresh_cd( 2, 0);
+	{ struct sdcom c; tur( &c, 6); }
+	aq_n = 0;
+	for (i = 0; i < 4; ++i) {
+		memset( &q[i], 0, sizeof q[i]);
+		if (i & 1) {
+			cdb10( q[i].cdb, 0x28, (unsigned long)(10 + i), 1);
+			q[i].unit = 5; q[i].nbyte = 2048;
+		} else {
+			cdb10( q[i].cdb, 0x28, (unsigned long)(100 + i), 4);
+			q[i].unit = 6; q[i].nbyte = 2048;
+		}
+		q[i].addr = b[i];
+		q[i].intr = aq_done;
+	}
+	intr_calls = 0;
+	for (i = 0; i < 4; ++i)
+		idequeue( 0, &q[i]);
+	pump();
+	CHECK( intr_calls == 4, "four mixed requests, four completions");
+	for (i = 0; i < 4; ++i)
+		CHECK( q[i].okay && q[i].status == 0, "mixed request GOOD");
+	CHECK( cd_equals( 11L, b[1], 2048) && cd_equals( 13L, b[3], 2048), "CD data intact");
+	CHECK( disk_equals( 0, 100L, b[0], 2048) && disk_equals( 0, 102L, b[2], 2048), "CF data intact");
+	CHECK( aq_n == 4 && aq_order[0] == 0 && aq_order[1] == 1 && aq_order[2] == 2 && aq_order[3] == 3, "completed in submission order");
+}
+
 int
 main()
 {
@@ -1489,6 +1837,13 @@ main()
 	fprintf( stderr, "== test_intr_not_mine\n"); test_intr_not_mine();
 	fprintf( stderr, "== test_spins_hw\n"); test_spins_hw();
 	fprintf( stderr, "== test_banner_mb\n"); test_banner_mb();
+	fprintf( stderr, "== test_atapi_attach\n"); test_atapi_attach();
+	fprintf( stderr, "== test_atapi_cdfs_sequence\n"); test_atapi_cdfs_sequence();
+	fprintf( stderr, "== test_atapi_phases\n"); test_atapi_phases();
+	fprintf( stderr, "== test_atapi_sense\n"); test_atapi_sense();
+	fprintf( stderr, "== test_atapi_packets\n"); test_atapi_packets();
+	fprintf( stderr, "== test_atapi_timeout\n"); test_atapi_timeout();
+	fprintf( stderr, "== test_atapi_queue_with_disk\n"); test_atapi_queue_with_disk();
 #if IDE_CACHE
 	fprintf( stderr, "== test_cache_ci_check\n"); test_cache_ci_check();
 	fprintf( stderr, "== test_cache_read\n"); test_cache_read();

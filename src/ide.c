@@ -110,6 +110,15 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
 #define IDE_REG_ALTSTAT	0x101A		/* R   (does not clear INTRQ) */
 #define IDE_REG_CONTROL	0x101A		/*   W device control */
 
+/* the same registers under their ATAPI names (ATA/ATAPI-4 9.10) */
+#define IDE_REG_IREASON	IDE_REG_NSECT	/* R   interrupt reason */
+#define IDE_REG_BCLO	IDE_REG_LCYL	/* R/W byte count 7:0  */
+#define IDE_REG_BCHI	IDE_REG_HCYL	/* R/W byte count 15:8 */
+#define IDE_IR_COD	0x01		/* 1: the DRQ phase moves the command packet */
+#define IDE_IR_IO	0x02		/* 1: device to host */
+#define IDE_ATAPI_SIGLO	0x14		/* LCYL/HCYL after an ATAPI device aborts IDENTIFY */
+#define IDE_ATAPI_SIGHI	0xEB
+
 #define IDE_IRQ_IDE	0x80		/* Gayle IRQ status: IDE interrupt pending */
 
 /*
@@ -164,6 +173,8 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
 #define IDE_CMD_SETMULT		0xC6
 #define IDE_CMD_FLUSH		0xE7	/* FLUSH CACHE (ATA-4+, optional) */
 #define IDE_CMD_IDENTIFY	0xEC
+#define IDE_CMD_PACKET		0xA0	/* ATAPI: a SCSI-style command packet follows */
+#define IDE_CMD_PIDENTIFY	0xA1	/* ATAPI: IDENTIFY PACKET DEVICE */
 #define IDE_CMD_SETFEATURES	0xEF
 
 /* IDENTIFY DEVICE words (ATA-2 8.12) */
@@ -181,6 +192,11 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
 #define IDE_ID_CAPS_LBA		0x0200
 #define IDE_ID_CMDSET2_FLUSH	0x1000
 #define IDE_ID_CMDSET2_VALID	0xC000	/* bit 15 clear, bit 14 set => word valid */
+/* IDENTIFY PACKET DEVICE word 0 (ATA/ATAPI-4 8.13) */
+#define IDE_PID_ATAPI_MASK	0xC000	/* bits 15:14 == 10b: an ATAPI device */
+#define IDE_PID_ATAPI		0x8000
+#define IDE_PID_TYPE( w)	(((w) >> 8) & 0x1F)	/* SCSI peripheral type, 5 = CD-ROM */
+#define IDE_PID_PKT16( w)	(((w) & 0x03) == 0x01)	/* 16-byte packets, else 12 */
 
 #define IDE_SECTOR	512
 #define IDE_MAXSECT	256		/* per READ/WRITE SECTOR(S) command (NSECT 0 == 256) */
@@ -250,10 +266,13 @@ ulong	ide_spins_reset = 8000000L * IDE_SPIN_SCALE;	/* BSY wait after reset / for
 ulong	ide_spins_short = 200000L * IDE_SPIN_SCALE;	/* DRQ wait inside the interrupt path */
 ulong	ide_spins_hw;			/* high-water: iterations a successful wait needed */
 
-int	ide_slave_enable = 0;		/* 0: never touch the slave (FlashAir rule) */
+int	ide_slave_enable = 0;		/* 0: never touch the slave (FlashAir rule),
+					 * 1: attach whatever answers there,
+					 * 2: attach it only if it is an ATAPI device (a CD-ROM) */
 int	ide_intr_enable  = 1;		/* 0: force polled I/O even if hooked */
 int	ide_board_force  = 0;		/* 0 auto-detect (A4000 only), 1.. = ideboards[] index+1, -1 = never probe */
 ulong	ide_timeout_secs = 20;		/* watchdog for an interrupt-driven command */
+ulong	ide_spins_atapi = 20000000L * IDE_SPIN_SCALE;	/* polled ATAPI phase wait (spin-up, seek) */
 int	ide_debug        = 0;		/* 0 quiet, 1 attach/errors, 2 every command */
 
 /*
@@ -551,7 +570,11 @@ ide_gayle_id()
 #define IDE_MODEL_LEN	40
 
 struct ideunit {
-	bool	present;		/* IDENTIFY succeeded, LBA usable */
+	bool	present;		/* IDENTIFY succeeded, LBA usable (or an ATAPI device) */
+	bool	atapi;			/* packet device: CDBs go to the drive as they are */
+	uchar	devtype;		/* ATAPI: SCSI peripheral type (5 = CD-ROM) */
+	uchar	pktlen;			/* ATAPI: command packet length, 12 or 16 */
+	bool	synth;			/* the pending sense is ours, not the drive's */
 	bool	flush;			/* FLUSH CACHE supported (IDENTIFY word 83 bit 12) */
 	ulong	nsectors;		/* LBA28 sector count */
 	ushort	multi;			/* IDENTIFY word 47 low byte (informational) */
@@ -572,6 +595,8 @@ ulong	ide_intr_count, ide_intr_spurious, ide_intr_timeouts;
 ulong	ide_intr_busy;		/* interrupts taken with the drive still BSY */
 ulong	ide_dup_submits;	/* requests re-submitted while active or queued (ignored) */
 ulong	ide_resets;		/* software resets issued after a timeout */
+ulong	ide_atapi_cmds;		/* ATAPI packet commands issued */
+ulong	ide_atapi_overrun;	/* ATAPI bytes the drive sent beyond nbyte (dropped) */
 
 /* --------------------------------------------------- low-level helpers */
 
@@ -650,6 +675,7 @@ int		skey, asc, ascq;
 	u->skey = skey;
 	u->asc  = asc;
 	u->ascq = ascq;
+	u->synth = TRUE;
 	u->errors++;
 }
 
@@ -730,8 +756,8 @@ int	nwords;
  * (IDE_DATA_SWAP 0).
  */
 static int
-ide_identify( drive, id)
-int	drive;
+ide_identify( drive, id, cmd)
+int	drive, cmd;		/* IDE_CMD_IDENTIFY, or IDE_CMD_PIDENTIFY for a packet device */
 ushort	*id;
 {
 	int	st, i;
@@ -739,7 +765,7 @@ ushort	*id;
 
 	if (ide_select( drive) < 0)
 		return -1;
-	TW( IDE_REG_COMMAND, IDE_CMD_IDENTIFY);
+	TW( IDE_REG_COMMAND, cmd);
 	ide_settle();
 	st = ide_wait( IDE_ST_BSY, 0, ide_spins);
 	if (st < 0 || (st & IDE_ST_ERR) || !(st & IDE_ST_DRQ))
@@ -758,20 +784,74 @@ ushort	*id;
  */
 static ulong	ide_secs_per_mb = 1048576L / IDE_SECTOR;
 
+/* IDENTIFY words 27..46: the model string, two characters per word */
+static void
+ide_model( u, id)
+struct ideunit	*u;
+ushort		*id;
+{
+	char	*m;
+	int	i;
+
+	m = u->model;
+	for (i = 0; i < IDE_MODEL_LEN / 2; ++i) {
+		*m++ = id[IDE_ID_MODEL + i] >> 8;
+		*m++ = id[IDE_ID_MODEL + i] & 0xFF;
+	}
+	*m = '\0';
+	while (m > u->model && m[-1] == ' ')	/* trim trailing blanks */
+		*--m = '\0';
+}
+
+/*
+ * An ATAPI device (a CD-ROM): IDENTIFY PACKET DEVICE gives its type and
+ * packet length.  It has no capacity of its own here -- the caller's READ
+ * CAPACITY goes to the drive like every other CDB.
+ */
+static void
+ide_attach_atapi( drive, u, id)
+int		drive;
+struct ideunit	*u;
+ushort		*id;
+{
+	if (ide_identify( drive, id, IDE_CMD_PIDENTIFY) < 0
+	    || (id[0] & IDE_PID_ATAPI_MASK) != IDE_PID_ATAPI) {
+		printf( "ide%d: ATAPI signature but no IDENTIFY PACKET DEVICE, ignored\n", drive);
+		return;
+	}
+	u->atapi   = TRUE;
+	u->devtype = IDE_PID_TYPE( id[0]);
+	u->pktlen  = IDE_PID_PKT16( id[0]) ? 16 : 12;
+	u->nsectors = 0;
+	u->flush   = FALSE;
+	ide_model( u, id);
+	u->present = TRUE;
+	printf( "ide%d: %s, ATAPI %s\n", drive, u->model,
+		u->devtype == 5 ? "CD-ROM" : "device");
+}
+
 static void
 ide_attach_unit( drive)
 int	drive;
 {
 	static ushort	id[IDE_SECTOR / 2];	/* static: kernel stacks are small */
 	struct ideunit	*u;
-	int		i;
-	char		*m;
 
 	u = &ideunits[drive];
 	u->present = FALSE;
-	if (ide_identify( drive, id) < 0) {
+	u->atapi = FALSE;
+	if (ide_identify( drive, id, IDE_CMD_IDENTIFY) < 0) {
+		/* a packet device aborts IDENTIFY DEVICE and leaves its signature */
+		if (TR( IDE_REG_LCYL) == IDE_ATAPI_SIGLO && TR( IDE_REG_HCYL) == IDE_ATAPI_SIGHI) {
+			ide_attach_atapi( drive, u, id);
+			return;
+		}
 		if (ide_debug)
 			printf( "ide%d: no drive\n", drive);
+		return;
+	}
+	if (drive == 1 && ide_slave_enable == 2) {
+		printf( "ide1: ATA device on the slave ignored (ide_slave_enable 2: ATAPI only)\n");
 		return;
 	}
 	if (!(id[IDE_ID_CAPS] & IDE_ID_CAPS_LBA)) {
@@ -784,14 +864,7 @@ int	drive;
 	u->multi = id[IDE_ID_MULTI] & 0xFF;
 	u->flush = ((id[IDE_ID_CMDSET2] & IDE_ID_CMDSET2_VALID) == 0x4000
 		    && (id[IDE_ID_CMDSET2] & IDE_ID_CMDSET2_FLUSH)) ? TRUE : FALSE;
-	m = u->model;
-	for (i = 0; i < IDE_MODEL_LEN / 2; ++i) {
-		*m++ = id[IDE_ID_MODEL + i] >> 8;
-		*m++ = id[IDE_ID_MODEL + i] & 0xFF;
-	}
-	*m = '\0';
-	while (m > u->model && m[-1] == ' ')	/* trim trailing blanks */
-		*--m = '\0';
+	ide_model( u, id);
 	u->present = TRUE;
 	printf( "ide%d: %s, %d sectors (%d MB)\n", drive, u->model,
 		(int)u->nsectors, (int)(u->nsectors / ide_secs_per_mb));
@@ -1076,12 +1149,15 @@ static struct {
 	uchar		*data;
 	ulong		nbyte, done;
 	ulong		gen;		/* bumped per started request: the watchdog counts ticks per gen */
+	int		atapi;		/* the request is an ATAPI packet command */
+	uchar		pkt[16];	/* ATAPI: the command packet */
 } ide_x;
 static int	ide_watch_armed;
 static ulong	ide_watch_ticks, ide_watch_gen;
 
 static void	ide_start();
 static void	ide_watchdog();
+static void	ide_watch_arm();
 static void	ide_reset_drive();
 int		idepresent();
 
@@ -1129,6 +1205,208 @@ ide_dequeue()
 		cp->next = 0;
 	}
 	return cp;
+}
+
+/* ------------------------------------------------ ATAPI packet commands */
+
+/*
+ * An ATAPI device (a CD-ROM) takes the caller's SCSI CDB itself, as a 12-
+ * or 16-byte packet after the PACKET command; the data then moves in DRQ
+ * phases whose direction (IREASON) and length (byte count) the device
+ * chooses.  The same step function runs polled (ide_atapi_polled loops to
+ * the end) and from ideintr() (one phase per interrupt).  READ(6)/WRITE(6),
+ * which MMC devices do not implement, become READ(10)/WRITE(10); everything
+ * else goes as it is, so INQUIRY, READ CAPACITY and REQUEST SENSE are the
+ * drive's own answers and a CHECK CONDITION leaves the real sense in the
+ * drive for the caller's REQUEST SENSE.  Bytes the drive sends beyond nbyte
+ * are drained and counted (ide_atapi_overrun), never stored.
+ */
+
+/* Build ide_x.pkt from the CDB; bytes past the CDB's group length are zero. */
+static void
+ide_atapi_packet( c)
+uchar	*c;
+{
+	uchar	*p;
+	ulong	lba, cnt;
+	int	i, n;
+
+	p = ide_x.pkt;
+	for (i = 0; i < 16; ++i)
+		p[i] = 0;
+	if (c[0] == SC_READ6 || c[0] == SC_WRITE6) {
+		lba = ((ulong)(c[1] & 0x1F) << 16) | ((ulong)c[2] << 8) | c[3];
+		cnt = c[4] ? c[4] : 256;
+		p[0] = c[0] == SC_READ6 ? SC_READ10 : SC_WRITE10;
+		p[3] = lba >> 16; p[4] = lba >> 8; p[5] = lba;
+		p[7] = cnt >> 8;  p[8] = cnt;
+		p[9] = c[5];
+		return;
+	}
+	switch (c[0] >> 5) {			/* SCSI-2 group code */
+	case 0:  n = 6;  break;
+	case 1:
+	case 2:  n = 10; break;
+	default: n = 12; break;
+	}
+	for (i = 0; i < n; ++i)
+		p[i] = c[i];
+}
+
+/* Describe cp as the ATAPI transfer in ide_x. */
+static void
+ide_atapi_setup( cp, drive)
+struct sdcom	*cp;
+int		drive;
+{
+	ide_x.atapi  = 1;
+	ide_x.drive  = drive;
+	ide_x.u      = &ideunits[drive];
+	ide_x.write  = 0;			/* the device picks the direction per phase */
+	ide_x.nodata = 0;
+	ide_x.cmdleft = 0;
+	ide_x.left   = 0;
+	ide_x.data   = (uchar *)cp->addr;
+	ide_x.nbyte  = cp->nbyte;
+	ide_x.done   = 0;
+	ide_atapi_packet( cp->cdb);
+}
+
+/*
+ * One step with the device not busy: move a DRQ phase, or finish.  Returns
+ * 1 (more phases follow), 0 (done, GOOD) or -1 (CHECK CONDITION).
+ */
+static int
+ide_atapi_step( st)
+int	st;
+{
+	struct ideunit	*u;
+	ulong		n, i, end, from;
+	ushort		w;
+	uchar		*d;
+	int		ir;
+
+	u = ide_x.u;
+	if (!(st & IDE_ST_DRQ)) {
+		if (st & IDE_ST_ERR) {		/* the drive holds the sense; key in ERROR 7:4 */
+			u->laststat = st;
+			u->lasterr  = TR( IDE_REG_ERROR);
+			u->skey     = u->lasterr >> 4;
+			u->errors++;
+			return -1;
+		}
+		if (st & IDE_ST_DF) {
+			ide_setsense( u, SK_HARDWARE, ASC_INTERNAL_FAILURE, 0);
+			return -1;
+		}
+		return 0;
+	}
+	ir = TR( IDE_REG_IREASON);
+	n  = TR( IDE_REG_BCLO) | ((ulong)TR( IDE_REG_BCHI) << 8);
+	if ((ir & IDE_IR_COD) || n == 0) {	/* a packet phase again, or nothing to move */
+		u->laststat = st;
+		ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+		ide_reset_drive();
+		return -1;
+	}
+	d = ide_x.data;
+	from = ide_x.done;
+	for (i = 0; i < n; i += 2) {
+		end = from + i;
+		if (ir & IDE_IR_IO) {
+			w = TRW();
+			if (end < ide_x.nbyte)
+				d[end] = w >> 8;
+			if (i + 1 < n && end + 1 < ide_x.nbyte)
+				d[end + 1] = w;
+		} else {
+			w = 0;
+			if (end < ide_x.nbyte)
+				w = (ushort)d[end] << 8;
+			if (i + 1 < n && end + 1 < ide_x.nbyte)
+				w |= d[end + 1];
+			TWW( w);
+		}
+	}
+	end = from + n;
+	if (end > ide_x.nbyte)
+		ide_atapi_overrun += end - (from > ide_x.nbyte ? from : ide_x.nbyte);
+	ide_x.done = end;
+	ide_settle();
+	return 1;
+}
+
+/*
+ * PACKET, then the command packet once the device asks for it.  Returns 0
+ * with the command running, or -1 (sense set or held by the drive).
+ */
+static int
+ide_atapi_issue()
+{
+	struct ideunit	*u;
+	ulong		bc;
+	int		st, i;
+
+	u = ide_x.u;
+	ide_atapi_cmds++;
+	if (ide_select( ide_x.drive) < 0) {
+		ide_setsense( u, SK_NOT_READY, ASC_LUN_NOT_READY, 0);
+		return -1;
+	}
+	bc = (ide_x.nbyte + 1) & ~1L;		/* byte count limit per DRQ phase */
+	if (bc == 0 || bc > 0xFFFE)
+		bc = 0xFFFE;
+	TW( IDE_REG_FEATURE, 0);		/* PIO, no overlap */
+	TW( IDE_REG_IREASON, 0);
+	TW( IDE_REG_BCLO, bc & 0xFF);
+	TW( IDE_REG_BCHI, (bc >> 8) & 0xFF);
+	TW( IDE_REG_COMMAND, IDE_CMD_PACKET);
+	ide_settle();
+	st = ide_wait_drq( ide_spins);
+	if (st < 0) {
+		ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+		ide_reset_drive();
+		return -1;
+	}
+	if (!(st & IDE_ST_DRQ)) {		/* PACKET itself refused (ERR or DF) */
+		(void) ide_atapi_step( st);
+		return -1;
+	}
+	if ((TR( IDE_REG_IREASON) & (IDE_IR_COD | IDE_IR_IO)) != IDE_IR_COD) {
+		ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+		ide_reset_drive();
+		return -1;
+	}
+	for (i = 0; i < u->pktlen; i += 2)
+		TWW( ((ushort)ide_x.pkt[i] << 8) | ide_x.pkt[i + 1]);
+	ide_settle();
+	return 0;
+}
+
+/* The whole command, polled.  0 GOOD, -1 CHECK CONDITION. */
+static int
+ide_atapi_polled( cp, drive)
+struct sdcom	*cp;
+int		drive;
+{
+	int	st, r;
+
+	ide_atapi_setup( cp, drive);
+	if (ide_atapi_issue() < 0)
+		return -1;
+	do {
+		st = ide_wait( IDE_ST_BSY, 0, ide_spins_atapi);
+		if (st < 0) {
+			ide_x.u->laststat = TR( IDE_REG_ALTSTAT);
+			ide_setsense( ide_x.u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+			if (ide_debug)
+				printf( "ide%d: ATAPI timeout, status 0x%x\n", drive, ide_x.u->laststat);
+			ide_reset_drive();
+			return -1;
+		}
+		r = ide_atapi_step( st);
+	} while (r > 0);
+	return r;
 }
 
 /* Copy one sector of the active transfer and advance the counters. */
@@ -1219,6 +1497,12 @@ ide_issue()
 		}
 		ide_xfer_sector();
 	}
+	ide_watch_arm();
+}
+
+static void
+ide_watch_arm()
+{
 	if (!ide_watch_armed) {
 		ide_watch_armed = 1;
 		timeout( ide_watchdog, (char *)0, HZ);
@@ -1236,6 +1520,15 @@ ide_start()
 		return;
 	ide_active = cp;
 	ide_x.gen++;
+	if (ideunits[(int)cp->unit == ide_master_unit ? 0 : 1].atapi) {
+		ide_atapi_setup( cp, (int)cp->unit == ide_master_unit ? 0 : 1);
+		if (ide_atapi_issue() < 0)
+			ide_finish( -1);
+		else
+			ide_watch_arm();
+		return;
+	}
+	ide_x.atapi = 0;
 	/* the transfer description is rebuilt from the CDB, so queued requests
 	 * need no side storage beyond cp->next */
 	ide_x.write = (cp->cdb[0] == SC_WRITE10 || cp->cdb[0] == SC_WRITE6);
@@ -1269,7 +1562,7 @@ ide_start()
 void
 ideintr()
 {
-	int	st;
+	int	st, i;
 
 	if (ide_bd == 0 || ide_state != 2 || !ide_irq_pending( ide_bd))
 		return;
@@ -1282,6 +1575,12 @@ ideintr()
 	}
 	if (st & IDE_ST_BSY) {			/* not for us yet; the drive will interrupt again */
 		ide_intr_busy++;
+		return;
+	}
+	if (ide_x.atapi) {			/* one DRQ phase, or the end of the command */
+		i = ide_atapi_step( st);
+		if (i <= 0)
+			ide_finish( i);
 		return;
 	}
 	if (st & (IDE_ST_ERR | IDE_ST_DF)) {
@@ -1444,6 +1743,24 @@ struct sdcom	*cp;
 		return TRUE;
 	}
 
+	/* ATAPI: the drive executes the CDB (our own sense, if pending, first) */
+	if (u->atapi && !(op == SC_REQ_SENSE && u->synth)) {
+		u->synth = FALSE;
+		if (ide_use_intr) {
+			ide_enqueue( cp);
+			if (ide_active == 0)
+				ide_start();
+			splx( s);
+			return TRUE;		/* completes from ideintr() */
+		}
+		if (ide_atapi_polled( cp, drive) < 0)
+			cp->status = SC_CHECK;
+		ide_cache_push( (ulong)data, (ulong)cp->nbyte);
+		splx( s);
+		ide_complete( cp);
+		return TRUE;
+	}
+
 	switch (op) {
 	case SC_TUR:
 	case SC_REZERO:
@@ -1490,6 +1807,7 @@ struct sdcom	*cp;
 			if (n > 12) data[12] = u->asc;
 			if (n > 13) data[13] = u->ascq;
 			u->skey = u->asc = u->ascq = 0;	/* consumed on read */
+			u->synth = FALSE;
 		}
 		break;
 
