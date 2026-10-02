@@ -89,6 +89,7 @@ static unsigned		alen, apos, aphase;	/* total, done, left in this DRQ phase */
 static unsigned char	pktbuf[16];
 static int		pidx;
 static unsigned		pkt_bc;
+static int		glitch_left;		/* see mock_drive.glitch */
 
 static struct mock_drive *
 cur()
@@ -136,7 +137,7 @@ mock_reset()
 	r_status[0] = r_status[1] = ST_DRDY | ST_DSC;
 	sel = 0; id_cnt = 0;
 	xmode = 0; xidx = 0; xlba = xleft = 0;
-	alen = apos = aphase = 0; pidx = 0;
+	alen = apos = aphase = 0; pidx = 0; glitch_left = 0;
 	mock_pkt_log_n = 0; mock_pkt_bc = 0; mock_atapi_out_n = 0;
 	memset( mock_pkt_last, 0, sizeof mock_pkt_last);
 }
@@ -330,7 +331,7 @@ atapi_done( d)
 struct mock_drive	*d;
 {
 	xmode = 0;
-	r_nsect = IR_COD | IR_IO;
+	r_nsect = d->no_ir3 ? IR_IO : IR_COD | IR_IO;
 	r_status[sel] = ST_DSC;
 	raise_intrq();
 }
@@ -398,6 +399,7 @@ struct mock_drive	*d;
 	unsigned	alloc;
 
 	memcpy( mock_pkt_last, pktbuf, 16);
+	glitch_left = d->glitch;
 	if (mock_pkt_log_n < 64)
 		mock_pkt_log[mock_pkt_log_n++] = p[0];
 	if (d->hang_on_pkt) {
@@ -641,6 +643,10 @@ status()
 
 	if (!d->present)
 		return sel == 0 ? 0xFF : 0x00;	/* open bus / device 1 absent */
+	if (d->atapi && glitch_left > 0 && mock_nien) {
+		glitch_left--;
+		return 0x00;
+	}
 	if (d->stuck_bsy || d->hung)
 		return ST_BSY;
 	return r_status[sel];
@@ -665,7 +671,7 @@ unsigned char	*vp;
 		*vp = status(); mock_intrq = 0; return 1;
 	case R_ALTSTAT:	*vp = status(); return 1;
 	case R_ERROR:	*vp = d->present ? r_error : 0xFF; return 1;
-	case R_NSECT:	*vp = d->present ? r_nsect : 0xFF; return 1;
+	case R_NSECT:	*vp = d->present ? (d->atapi && glitch_left > 0 && mock_nien ? IR_COD : r_nsect) : 0xFF; return 1;
 	case R_SECT:	*vp = d->present ? r_sect  : 0xFF; return 1;
 	case R_LCYL:	*vp = d->present ? r_lcyl  : 0xFF; return 1;
 	case R_HCYL:	*vp = d->present ? r_hcyl  : 0xFF; return 1;

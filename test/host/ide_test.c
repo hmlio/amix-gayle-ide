@@ -28,7 +28,7 @@ extern unsigned long	ide_intr_count, ide_intr_spurious, ide_intr_timeouts, ide_t
 extern unsigned long	ide_dup_submits, ide_resets, ide_pagecross_n, ide_intr_busy;
 extern int	ide_slave_enable, ide_debug, ide_master_unit, ide_slave_unit;
 extern int	ide_intr_enable, ide_board_force;
-extern unsigned long	ide_spins_hw, ide_atapi_cmds, ide_atapi_overrun, ide_spins_atapi;
+extern unsigned long	ide_spins_hw, ide_atapi_cmds, ide_atapi_overrun, ide_spins_atapi, ide_atapi_irlate;
 #if IDE_CACHE
 extern long	ide_cache;
 extern unsigned long	ide_push_n, ide_ci_ok;
@@ -1798,6 +1798,56 @@ test_atapi_queue_with_disk()
 	CHECK( aq_n == 4 && aq_order[0] == 0 && aq_order[1] == 1 && aq_order[2] == 2 && aq_order[3] == 3, "completed in submission order");
 }
 
+/*
+ * Polled: BSY and DRQ clear is the end only with IREASON CoD|IO.  The mock's
+ * `glitch' is Amiberry's model (status 0, IREASON CoD, before the data phase
+ * shows); `no_ir3' is a device that never sets CoD|IO at the end.
+ */
+static void
+test_atapi_polled_status_phase()
+{
+	struct sdcom	cp;
+	static char	buf[4 * 2048];
+	unsigned char	cdb[12];
+	unsigned long	l0;
+	int		i;
+
+	fresh_cd( 2, 1);
+	mock_drv[1].glitch = 50;
+	l0 = ide_atapi_irlate;
+	for (i = 0; i < 4; ++i) {
+		memset( buf, 0x5A, sizeof buf);
+		cdb10( cdb, 0x28, (unsigned long)(20 + i), 2);
+		run( &cp, 5, cdb, 10, buf, 2 * 2048);
+		CHECK( cp.okay && cp.status == 0 && cd_equals( (unsigned long)(20 + i), buf, 2 * 2048), "glitching drive: polled READ(10) data intact");
+	}
+	memset( cdb, 0, 12); cdb[0] = 0x12; cdb[4] = 36;
+	run( &cp, 5, cdb, 6, buf, 36);
+	CHECK( cp.okay && cp.status == 0 && (buf[0] & 0x1F) == 5, "glitching drive: INQUIRY intact");
+	memset( cdb, 0, 12);
+	run( &cp, 5, cdb, 6, 0, 0);
+	CHECK( cp.okay && cp.status == 0, "glitching drive: TUR (no data) completes");
+	CHECK( ide_atapi_irlate == l0, "glitching drive: every end seen in the status phase");
+
+	fresh_cd( 2, 0);				/* interrupt mode is not affected */
+	mock_drv[1].glitch = 50;
+	cdb10( cdb, 0x28, 30L, 1);
+	run( &cp, 5, cdb, 10, buf, 2048);
+	CHECK( cp.okay && cp.status == 0 && cd_equals( 30L, buf, 2048), "glitch knob: interrupt mode READ intact");
+
+	fresh_cd( 2, 1);
+	mock_drv[1].no_ir3 = 1;
+	l0 = ide_atapi_irlate;
+	cdb10( cdb, 0x28, 40L, 2);
+	run( &cp, 5, cdb, 10, buf, 2 * 2048);
+	CHECK( cp.okay && cp.status == 0 && cd_equals( 40L, buf, 2 * 2048), "no CoD|IO at the end: polled READ still completes, data intact");
+	CHECK( ide_atapi_irlate == l0 + 1, "no CoD|IO at the end: accepted after the quiet reads, counted");
+	memset( cdb, 0, 12);
+	mock_drv[1].no_medium = 1;
+	run( &cp, 5, cdb, 6, 0, 0);
+	CHECK( cp.okay && cp.status == 0x02 && ide_atapi_irlate == l0 + 1, "an error end needs no CoD|IO");
+}
+
 int
 main()
 {
@@ -1844,6 +1894,7 @@ main()
 	fprintf( stderr, "== test_atapi_packets\n"); test_atapi_packets();
 	fprintf( stderr, "== test_atapi_timeout\n"); test_atapi_timeout();
 	fprintf( stderr, "== test_atapi_queue_with_disk\n"); test_atapi_queue_with_disk();
+	fprintf( stderr, "== test_atapi_polled_status_phase\n"); test_atapi_polled_status_phase();
 #if IDE_CACHE
 	fprintf( stderr, "== test_cache_ci_check\n"); test_cache_ci_check();
 	fprintf( stderr, "== test_cache_read\n"); test_cache_read();

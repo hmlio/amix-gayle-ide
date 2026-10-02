@@ -48,6 +48,9 @@ struct mock_drive {
 	unsigned	chunk;		/* bytes per DRQ phase (0: the host's byte count limit) */
 	unsigned char	skey, asc;	/* sense held for REQUEST SENSE */
 	int		hang_on_pkt;	/* accept the next packet, then stay BSY until SRST */
+	int		glitch;		/* after each packet, polled status reads 0 (BSY, DRQ clear, IREASON
+					 * CoD) this many times before the real phase shows (Amiberry) */
+	int		no_ir3;		/* completion leaves IREASON at IO instead of CoD|IO */
 };
 
 #define MOCK_CD_BLOCK	2048

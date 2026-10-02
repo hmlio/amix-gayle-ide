@@ -597,6 +597,7 @@ ulong	ide_dup_submits;	/* requests re-submitted while active or queued (ignored)
 ulong	ide_resets;		/* software resets issued after a timeout */
 ulong	ide_atapi_cmds;		/* ATAPI packet commands issued */
 ulong	ide_atapi_overrun;	/* ATAPI bytes the drive sent beyond nbyte (dropped) */
+ulong	ide_atapi_irlate;	/* polled ATAPI ends accepted without IREASON CoD|IO */
 
 /* --------------------------------------------------- low-level helpers */
 
@@ -1383,18 +1384,30 @@ ide_atapi_issue()
 	return 0;
 }
 
-/* The whole command, polled.  0 GOOD, -1 CHECK CONDITION. */
+/*
+ * The whole command, polled.  0 GOOD, -1 CHECK CONDITION.
+ *
+ * Polling sees states an interrupt never shows.  BSY and DRQ clear with no
+ * error is the end of the command only in the status phase, where IREASON
+ * reads CoD|IO (ATA/ATAPI-4 9.10); Amiberry's ATAPI model passes through
+ * BSY=0/DRQ=0 with IREASON still CoD while it prepares the data, and taking
+ * that as the end completed reads with nothing transferred.  A device that
+ * never sets CoD|IO at the end is accepted after ide_spins_short quiet reads
+ * (ide_atapi_irlate counts those).
+ */
 static int
 ide_atapi_polled( cp, drive)
 struct sdcom	*cp;
 int		drive;
 {
+	ulong	quiet;
 	int	st, r;
 
 	ide_atapi_setup( cp, drive);
 	if (ide_atapi_issue() < 0)
 		return -1;
-	do {
+	quiet = 0;
+	for (;;) {
 		st = ide_wait( IDE_ST_BSY, 0, ide_spins_atapi);
 		if (st < 0) {
 			ide_x.u->laststat = TR( IDE_REG_ALTSTAT);
@@ -1404,9 +1417,17 @@ int		drive;
 			ide_reset_drive();
 			return -1;
 		}
+		if (!(st & (IDE_ST_DRQ | IDE_ST_ERR | IDE_ST_DF))
+		    && (TR( IDE_REG_IREASON) & (IDE_IR_COD | IDE_IR_IO)) != (IDE_IR_COD | IDE_IR_IO)) {
+			if (quiet++ < ide_spins_short)
+				continue;		/* not the status phase yet */
+			ide_atapi_irlate++;
+		}
+		quiet = 0;
 		r = ide_atapi_step( st);
-	} while (r > 0);
-	return r;
+		if (r <= 0)
+			return r;
+	}
 }
 
 /* Copy one sector of the active transfer and advance the counters. */

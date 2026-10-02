@@ -51,7 +51,7 @@ login works. To my knowledge the first Amix boot on an A4000 with root on IDE.
 - ✅ **Native build** — compiles with the Amix K&R `cc` without diagnostics, links `checkunix`-clean
   through amix-kerntools, boots on an A3000 profile (probe silent) and the Amiberry A4000/AGA profile.
 - ✅ **Host harness** — the unmodified driver source against a mock Gayle/ATA model with an ATAPI
-  CD-ROM, built twice: the 68030 object (1197 checks) and the 68040/68060 one (1511 checks, cache
+  CD-ROM, built twice: the 68030 object (1253 checks) and the 68040/68060 one (1576 checks, cache
   and ordering included).
 - 🟡 **Board table** — A4000 entry proven; A1200/A600 entries (task file `0xDA0000`, latched INTREQ,
   Gayle ID register) follow NetBSD/Amiberry and are untested. They are never auto-detected: select
@@ -145,7 +145,10 @@ make -C test/host check      # both variants; exit 0 == every check passed
   are drained, not stored (`ide_atapi_overrun` counts them), so a 512-byte `dd.c` read of a
   2048-byte CD block cannot overrun its buffer. `/dev/dsk` is not the way to a CD: `dd.c` expects
   512-byte blocks and an RDB. Polled ATAPI waits allow `ide_spins_atapi` iterations per phase (a
-  disc spinning up); interrupt-driven ones are bounded by the `ide_timeout_secs` watchdog.
+  disc spinning up); interrupt-driven ones are bounded by the `ide_timeout_secs` watchdog. A polled
+  command ends only in the status phase (BSY and DRQ clear with IREASON = CoD|IO): Amiberry's model
+  shows BSY and DRQ clear for a moment before the data phase, and a device that never sets CoD|IO at
+  the end is accepted after `ide_spins_short` quiet reads (`ide_atapi_irlate` counts those).
 - Stock Amix `init` behaviour, not the driver, but every IDE box will meet it: a run-level change requested
   while **nobody is logged in on the console** (the console `getty` sits at `login:`, and `shutdown -i6`
   comes over telnet) stops at `INIT: New run level: 6` and never spawns `/etc/rc6`. The disk keeps
