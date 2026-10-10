@@ -19,5 +19,5 @@ form `id >= 0x22` therefore classifies an **NTSC ECS** machine (0x30) as AGA. In
 lose its internal SCSI; in an IDE probe it would touch `0xDD2020` on an NTSC A3000.
 
 Robust test: `((vposr >> 8) & 0x0F) >= 2` → AGA. Verified against the emulator model on
-the A3000 profile (reads 0x2000 / 0xA000). Real-hardware confirmation on the A4000
-(expected 0x23 / 0xA300 for PAL) is pending.
+the A3000 profile (reads 0x2000 / 0xA000), and on a real PAL A4000 (2026-10-10: reads
+0xA300, id 0x23).

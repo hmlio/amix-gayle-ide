@@ -114,9 +114,8 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
  * 0x20/0x30, AGA Alice 0x22/0x23/0x32/0x33 -- bit 4 (0x10) is the video
  * standard, the low nibble is >= 2 only for Alice.  (Testing "id >= 0x22", as
  * some sources do, misclassifies an NTSC ECS machine, id 0x30, as AGA.)
- * Verified against the Amiberry/WinUAE VPOSR model; the A4000 boot of
- * 2026-09-27 (CHANGELOG) passed this gate, the exact id read there was not
- * recorded ([verify]: expected 0x23 PAL / 0x33 NTSC).
+ * Verified against the Amiberry/WinUAE VPOSR model and on a real PAL A4000
+ * (2026-10-10: VPOSR 0xA300, id 0x23).
  */
 #define IDE_VPOSR_ADDR	0xDFF004L
 #define IDE_VPOSR_ID( v)	(((v) >> 8) & 0x7F)

@@ -36,6 +36,7 @@ login works. To my knowledge the first Amix boot on an A4000 with root on IDE.
 
 - ✅ **Probe** `idepresent()` — AGA chipset gate via VPOSR, then a task-file write/readback at the
   A4000 base; on an A3000 it reads VPOSR and nothing else. Automatic detection is A4000-only.
+  A real PAL A4000 reads VPOSR id `0x23`.
 - ✅ **Command execution** `idequeue()` — READ/WRITE(6)/(10), REQUEST SENSE, INQUIRY, TEST UNIT READY,
   READ CAPACITY(10), MODE SENSE(6), START/STOP UNIT, SYNCHRONIZE CACHE, VERIFY(10) → ATA READ/WRITE
   SECTOR(S), IDENTIFY DEVICE, FLUSH CACHE, READ VERIFY SECTOR(S), with synthesised sense data. PIO
@@ -51,8 +52,7 @@ login works. To my knowledge the first Amix boot on an A4000 with root on IDE.
   one with `ide_board_force` (2 = A1200, 3 = A600), which is the only time the Gayle ID register at
   `0xDE1000` is read. Amix itself has further A1200/A600 blockers (fast RAM expected at `0x07000000`).
 - 🟡 **Open on real hardware** — stress and power-cycle `fsck` runs, spin-count calibration of the
-  bounded polled waits, the installer route, the VPOSR id value as read on the A4000 (`0x23` PAL /
-  `0x33` NTSC expected), and cache inhibition of the register ranges (assumed from the stock kernel's
+  bounded polled waits, the installer route, and cache inhibition of the register ranges (assumed from the stock kernel's
   transparent-translation setup). These are the `[verify]` markers left in `src/ide.c`. The **IDE
   slave** stays disabled unless `ide_slave_enable` is set.
 
