@@ -235,8 +235,8 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
  * length whatever the CPU, and only the loop overhead shrinks on a faster
  * one.  An IDE_CACHE (68040/68060) build therefore scales the budgets by
  * IDE_SPIN_SCALE (4), which keeps the wall-clock floor at or above the 030's
- * for any per-iteration speed-up up to 4x.  [verify] on metal: ide_spins_hw
- * records the most iterations a successful wait has needed.
+ * for any per-iteration speed-up up to 4x.  ide_spins_hw records the most
+ * iterations a successful wait has needed (a real 68060 A4000: 2765).
  */
 #ifndef IDE_SPIN_SCALE
 #if IDE_CACHE

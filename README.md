@@ -54,7 +54,8 @@ login works. To my knowledge the first Amix boot on an A4000 with root on IDE.
   `0xDE1000` is read. Amix itself has further A1200/A600 blockers (fast RAM expected at `0x07000000`).
 - 🟡 **Open on real hardware** — stress and power-cycle `fsck` runs, spin-count calibration of the
   bounded polled waits, the installer route, and cache inhibition of the register ranges (assumed from the stock kernel's
-  transparent-translation setup on the 68030; checked at attach on the 68040/68060 line). These are the `[verify]` markers left in `src/ide.c`. The **IDE
+  transparent-translation setup on the 68030; checked at attach on the 68040/68060 line, where a
+  real 68060 passes). These are the `[verify]` markers left in `src/ide.c`. The **IDE
   slave** stays disabled unless `ide_slave_enable` is set.
 
 The IDE master is presented as **SCSI unit 6** (`ide_master_unit`) so that the stock root configuration
@@ -169,6 +170,12 @@ compiles it with `-m68040 -DIDE_NBPP=4096 -DIDE_CACHE=1` and registers the port 
 
 Where the port sits in card order beside the Z3660's SCSI is the relink pass's decision, not the
 driver's.
+
+**On hardware** (2026-10-10): an A4000 with a Z3660 in real 68060 mode, an SD-to-CF adapter as
+master and an ATAPI DVD-RAM as slave. DTT0 reads `0x003FC060` (`ide_ci_ok` 1); 64 MB raw reads repeat
+with equal checksums; writes read back intact; `ide_spins_hw` 2765; Amix boots with root and swap on
+the IDE disk. With CD and disk I/O back to back, logins can stall for a minute or two: the IPL 2 hold
+described above.
 
 ## Sharing a kernel with a SCSI host adapter
 
