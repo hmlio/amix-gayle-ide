@@ -44,7 +44,9 @@ login works. To my knowledge the first Amix boot on an A4000 with root on IDE.
 - 🟡 **ATAPI CD-ROM** — an ATAPI device (detected by its signature, then IDENTIFY PACKET DEVICE) gets
   the caller's CDBs as PACKET commands: INQUIRY, READ CAPACITY, READ(10), REQUEST SENSE are the
   drive's own answers, so a cdfs-capable kernel mounts it like a SCSI CD-ROM (see Hardware notes).
-  Host harness and Amiberry (68030 and 68060); not yet on real hardware.
+  Host harness, Amiberry (68030 and 68060), and a real drive on an A4000 (68060, polled): a 287 MB
+  data CD reads intact, also with the IDE master busy. Interrupt-mode ATAPI is not yet run on
+  hardware.
 - ✅ **Interrupt-driven I/O** `ideintr()` — level-2 handler hooked into `int2_tbl[]` by
   `kernel.c.patch`, one interrupt per sector, `timeout()` watchdog; falls back to polled I/O on an
   unpatched kernel. Emulation: 107k interrupts, 2 spurious, 0 timeouts; 10 MB raw read 3.4 s → 0.7 s sys.
