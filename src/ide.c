@@ -365,6 +365,8 @@ static int		ide_use_intr;	/* attach(): ideintr is in int2_tbl[] and enabled */
 
 /* interrupt-path bookkeeping (kmem-readable) */
 ulong	ide_intr_count, ide_intr_spurious, ide_intr_timeouts;
+ulong	ide_dup_submits;	/* requests re-submitted while active or queued (ignored) */
+ulong	ide_resets;		/* software resets issued after a timeout */
 
 /* --------------------------------------------------- low-level helpers */
 
@@ -604,6 +606,35 @@ ide_attach()
 	printf( "ide: %s, %s I/O\n", ide_bd->name, ide_use_intr ? "interrupt" : "polled");
 }
 
+/*
+ * Software reset of the cable after a command timed out.  The drive may
+ * still be executing the abandoned command and would otherwise complete it
+ * -- interrupt, data and all -- into whatever request comes next.  SRST
+ * (held for well over the 5 us ATA-2 asks) aborts it on both drives; then
+ * BSY is waited out (bounded), STATUS is read to drop a pending INTRQ, the
+ * Gayle latch is acknowledged where there is one, and interrupt enable is
+ * restored to the attach-time setting.  No SET FEATURES state is lost: the
+ * driver sets none.
+ */
+static void
+ide_reset_drive()
+{
+	int	i, st;
+
+	ide_resets++;
+	TW( IDE_REG_CONTROL, IDE_CTL_SRST | IDE_CTL_NIEN);
+	for (i = 0; i < 16; ++i)
+		(void) TR( IDE_REG_ALTSTAT);
+	TW( IDE_REG_CONTROL, IDE_CTL_NIEN);
+	ide_settle();
+	st = ide_wait( IDE_ST_BSY, 0, ide_spins_reset);
+	(void) TR( IDE_REG_STATUS);
+	ide_irq_ack( ide_bd);
+	TW( IDE_REG_CONTROL, ide_use_intr ? 0 : IDE_CTL_NIEN);
+	if (ide_debug)
+		printf( "ide: drive reset after timeout, status 0x%x\n", st);
+}
+
 /* --------------------------------------------------------- polled I/O */
 
 /* Program the task file for `n' sectors at `lba' and issue the command. */
@@ -654,6 +685,7 @@ ulong		nbyte;
 					ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
 					if (ide_debug)
 						printf( "ide%d: timeout, status 0x%x\n", drive, u->laststat);
+					ide_reset_drive();
 				} else
 					ide_ataerror( u, st, write);
 				return -1;
@@ -669,9 +701,10 @@ ulong		nbyte;
 		}
 		st = ide_wait( IDE_ST_BSY, 0, ide_spins);
 		if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
-			if (st < 0)
+			if (st < 0) {
 				ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
-			else
+				ide_reset_drive();
+			} else
 				ide_ataerror( u, st, write);
 			return -1;
 		}
@@ -698,8 +731,10 @@ int		drive;
 	if (st < 0 || (st & IDE_ST_ERR)) {
 		if (st >= 0)
 			ide_ataerror( u, st, 1);
-		else
+		else {
+			ide_reset_drive();
 			ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+		}
 		return -1;
 	}
 	return 0;
@@ -765,18 +800,40 @@ static struct sdcom	*ide_qhead, *ide_qtail, *ide_active;
 static struct {
 	struct ideunit	*u;
 	int		drive, write;
+	int		flush;		/* SYNCHRONIZE CACHE: one FLUSH CACHE, no data */
 	ulong		lba;		/* next LBA to issue / transfer */
 	ulong		left;		/* sectors of the request not yet transferred */
 	ulong		cmdleft;	/* sectors still to move in the current ATA command */
 	uchar		*data;
 	ulong		nbyte, done;
+	ulong		gen;		/* bumped per started request: the watchdog counts ticks per gen */
 } ide_x;
 static int	ide_watch_armed;
-static ulong	ide_watch_ticks;
+static ulong	ide_watch_ticks, ide_watch_gen;
 
 static void	ide_start();
 static void	ide_watchdog();
+static void	ide_reset_drive();
 int		idepresent();
+
+/* Is cp on the cable or waiting for it?  (dd.c can hand us the same sdcom
+ * twice: its completion routine calls iodone() before it starts the next
+ * buffer, and iodone's callback may resubmit the disk's single sdcom while
+ * the first submission is still in flight.  Linking it again would make the
+ * queue eat its own tail.) */
+static int
+ide_pending( cp)
+struct sdcom	*cp;
+{
+	struct sdcom	*p;
+
+	if (cp == ide_active)
+		return 1;
+	for (p = ide_qhead; p; p = (struct sdcom *)p->next)
+		if (p == cp)
+			return 1;
+	return 0;
+}
 
 static void
 ide_enqueue( cp)
@@ -844,9 +901,10 @@ int	err;
 }
 
 /*
- * Issue the next ATA command of the active transfer.  A write must be primed
+ * Issue the next ATA command of the active request.  A write must be primed
  * with its first sector before the drive interrupts; a read interrupts as soon
- * as the first sector is ready.
+ * as the first sector is ready; a FLUSH CACHE interrupts once, when done, and
+ * moves no data (ideintr() sees cmdleft == 0 and left == 0 and finishes).
  */
 static void
 ide_issue()
@@ -854,6 +912,10 @@ ide_issue()
 	ulong	n;
 	int	st;
 
+	if (ide_x.flush && !ide_x.u->flush) {	/* nothing to flush on an old drive */
+		ide_finish( 0);
+		return;
+	}
 	n = ide_x.left > IDE_MAXSECT ? IDE_MAXSECT : ide_x.left;
 	st = ide_select( ide_x.drive);
 	if (st < 0 || !(st & IDE_ST_DRDY)) {
@@ -862,7 +924,11 @@ ide_issue()
 		return;
 	}
 	ide_x.cmdleft = n;
-	ide_program( ide_x.drive, ide_x.write, ide_x.lba, n);
+	if (ide_x.flush) {
+		TW( IDE_REG_COMMAND, IDE_CMD_FLUSH);
+		ide_settle();
+	} else
+		ide_program( ide_x.drive, ide_x.write, ide_x.lba, n);
 	if (ide_x.write) {
 		st = ide_wait_drq( ide_spins_short);
 		if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
@@ -891,11 +957,15 @@ ide_start()
 	if (cp == 0)
 		return;
 	ide_active = cp;
-	ide_watch_ticks = 0;
+	ide_x.gen++;
 	/* the transfer description is rebuilt from the CDB, so queued requests
 	 * need no side storage beyond cp->next */
 	ide_x.write = (cp->cdb[0] == SC_WRITE10 || cp->cdb[0] == SC_WRITE6);
-	if (cp->cdb[0] == SC_READ6 || cp->cdb[0] == SC_WRITE6) {
+	ide_x.flush = (cp->cdb[0] == SC_SYNC_CACHE);
+	if (ide_x.flush) {
+		ide_x.lba  = 0;
+		ide_x.left = 0;
+	} else if (cp->cdb[0] == SC_READ6 || cp->cdb[0] == SC_WRITE6) {
 		ide_x.lba  = ((ulong)(cp->cdb[1] & 0x1F) << 16) | ((ulong)cp->cdb[2] << 8) | cp->cdb[3];
 		ide_x.left = cp->cdb[4] ? cp->cdb[4] : 256;
 	} else {
@@ -981,11 +1051,16 @@ ide_watchdog()
 
 	s = sdspl();
 	if (ide_active) {
+		if (ide_watch_gen != ide_x.gen) {	/* a new request since the last tick */
+			ide_watch_gen = ide_x.gen;
+			ide_watch_ticks = 0;
+		}
 		if (++ide_watch_ticks > ide_timeout_secs) {
 			ide_intr_timeouts++;
 			ide_x.u->laststat = TR( IDE_REG_STATUS);
 			printf( "ide%d: command timed out (status 0x%x)\n", ide_x.drive, ide_x.u->laststat);
 			ide_setsense( ide_x.u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+			ide_reset_drive();		/* quiet cable before the next request starts */
 			ide_finish( -1);
 		}
 	}
@@ -1036,6 +1111,13 @@ struct sdcom	*cp;
 	int		drive, write, s, i;
 
 	s = sdspl();
+	if (ide_pending( cp)) {			/* already in flight: it completes once, later */
+		ide_dup_submits++;
+		if (ide_debug)
+			printf( "ide: request re-submitted while in flight, ignored\n");
+		splx( s);
+		return TRUE;
+	}
 	if (ide_state == 0) {			/* sd.c probes first; be robust anyway */
 		char	*pa;
 		(void) idepresent( &pa);
@@ -1127,6 +1209,17 @@ struct sdcom	*cp;
 		break;
 
 	case SC_SYNC_CACHE:
+		/* Interrupt mode: take the queue like a transfer, so the flush
+		 * runs after the writes queued before it and never overwrites
+		 * the task file of a command in flight.  Polled mode has
+		 * nothing in flight and flushes inline. */
+		if (ide_use_intr) {
+			ide_enqueue( cp);
+			if (ide_active == 0)
+				ide_start();
+			splx( s);
+			return TRUE;		/* completes from ideintr() */
+		}
 		if (ide_flush( u, drive) < 0)
 			cp->status = SC_CHECK;
 		break;

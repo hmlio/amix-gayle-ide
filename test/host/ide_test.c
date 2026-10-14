@@ -25,6 +25,7 @@ extern void	idereset();
 extern void	ideintr();
 extern unsigned long	ide_spins, ide_spins_reset, ide_spins_short, ide_cq_overflow;
 extern unsigned long	ide_intr_count, ide_intr_spurious, ide_intr_timeouts, ide_timeout_secs;
+extern unsigned long	ide_dup_submits, ide_resets;
 extern int	ide_slave_enable, ide_debug, ide_master_unit, ide_slave_unit;
 extern int	ide_intr_enable, ide_board_force;
 
@@ -73,6 +74,7 @@ int	unit_count;
 	ide_spins_reset = 200000;
 	ide_spins_short = 20000;
 	ide_intr_count = ide_intr_spurious = ide_intr_timeouts = 0;
+	ide_dup_submits = ide_resets = 0;
 	if (unit_count >= 1)
 		mock_add_drive( 0, 4096L, "MOCK CF CARD 2GB", 1);
 	if (unit_count >= 2)
@@ -655,6 +657,83 @@ test_watchdog()
 	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after watchdog");
 }
 
+/*
+ * A drive that hangs mid-command is reset (SRST) when the watchdog gives up,
+ * so the abandoned command cannot complete into the next request; a stale
+ * interrupt afterwards is discarded; a drive that stays busy even after the
+ * reset fails every request without hanging.
+ */
+static void
+test_timeout_recovery()
+{
+	struct sdcom	cp;
+	static char	buf[512];
+	unsigned char	sense[18];
+
+	fresh( 1);
+	tur( &cp, 6);
+	CHECK( mock_nien == 0, "interrupt mode: drive interrupts enabled");
+	mock_drv[0].hang_on_cmd = 1;
+	ide_timeout_secs = 0;
+	memset( &cp, 0, sizeof cp);
+	cp.cdb[0] = 0x28; cp.cdb[5] = 100; cp.cdb[8] = 1;
+	cp.addr = buf; cp.nbyte = 512; cp.unit = 6; cp.intr = done;
+	intr_calls = 0;
+	idequeue( 0, &cp);
+	pump();
+	CHECK( intr_calls == 0 && mock_drv[0].hung == 1, "hung drive: command accepted, then nothing completes");
+	mock_fire_timeouts();
+	CHECK( intr_calls == 1 && cp.okay && cp.status == 0x02, "hung drive: watchdog failed the request");
+	CHECK( ide_intr_timeouts == 1 && ide_resets == 1, "hung drive: timeout and reset counted");
+	CHECK( mock_srst_count == 1, "hung drive: SRST reached the drive");
+	CHECK( mock_drv[0].hung == 0, "hung drive: the reset un-hung it");
+	CHECK( mock_intrq == 0, "after reset: no INTRQ pending");
+	CHECK( mock_nien == 0, "after reset: interrupts re-enabled at the drive");
+	CHECK( mock_timeouts_pending() == 0, "after reset: watchdog disarmed");
+	reqsense( &cp, 6, sense);
+	CHECK( sense[2] == 0x04 && sense[12] == 0x08, "after reset: HARDWARE ERROR / LU communication failure");
+	read10( &cp, 6, 101L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 101L, buf, 512), "next request on the reset drive: GOOD, right data");
+
+	/* a stale interrupt with nothing active is discarded */
+	intr_calls = 0;
+	mock_intrq = 1;
+	pump();
+	CHECK( intr_calls == 0 && ide_intr_spurious == 1, "stale INTRQ, no request active: counted as spurious, nothing completed");
+	read10( &cp, 6, 102L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 102L, buf, 512), "request after the stale interrupt: GOOD");
+
+	/* a drive that stays busy through the reset: every request fails, nothing hangs */
+	mock_drv[0].stuck_bsy = 1;
+	ide_spins = 1000;
+	memset( &cp, 0, sizeof cp);
+	cp.cdb[0] = 0x28; cp.cdb[5] = 103; cp.cdb[8] = 1;
+	cp.addr = buf; cp.nbyte = 512; cp.unit = 6; cp.intr = done;
+	intr_calls = 0;
+	idequeue( 0, &cp);
+	CHECK( intr_calls == 1 && cp.okay && cp.status == 0x02, "stuck after reset: request fails at once (NOT READY), no hang");
+	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after stuck drive");
+	mock_drv[0].stuck_bsy = 0;
+	ide_spins = 200000;
+	read10( &cp, 6, 104L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0, "drive back: requests succeed again");
+	ide_timeout_secs = 20;
+
+	/* polled fallback: a spin timeout resets the drive too */
+	fresh( 1);
+	int2_tbl[0] = 0;
+	tur( &cp, 6);
+	mock_drv[0].hang_on_cmd = 1;
+	ide_spins = 1000;
+	read10( &cp, 6, 105L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0x02, "polled, hung drive: CHECK CONDITION");
+	CHECK( mock_srst_count == 1 && ide_resets == 1 && mock_drv[0].hung == 0, "polled, hung drive: reset issued, drive un-hung");
+	CHECK( mock_nien == 1, "polled: interrupts stay disabled after the reset");
+	ide_spins = 200000;
+	read10( &cp, 6, 106L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 106L, buf, 512), "polled: next request GOOD");
+}
+
 static void
 test_nolba_drive_ignored()
 {
@@ -735,6 +814,146 @@ test_queue_order()
 		CHECK( disk_equals( 0, 50L + 2 * i, qbuf[i], 1024), "queued request data");
 	}
 	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after queue drain");
+}
+
+/*
+ * SYNCHRONIZE CACHE in interrupt mode takes the queue: submitted behind a
+ * READ in flight and ahead of a WRITE, the FLUSH CACHE reaches the drive
+ * after the READ has finished and before the WRITE starts.
+ */
+static void
+test_sync_cache_queued()
+{
+	unsigned char	sync[10];
+	int		i;
+
+	fresh( 1);
+	{ struct sdcom cp; tur( &cp, 6); }
+	intr_calls = 0; qn = 0;
+	memset( sync, 0, sizeof sync); sync[0] = 0x35;
+	memset( qreq, 0, sizeof qreq);
+	qreq[0].cdb[0] = 0x28; qreq[0].cdb[5] = 90; qreq[0].cdb[8] = 2;
+	qreq[0].addr = qbuf[0]; qreq[0].nbyte = 1024;
+	memcpy( qreq[1].cdb, sync, 10);
+	qreq[2].cdb[0] = 0x2A; qreq[2].cdb[5] = 94; qreq[2].cdb[8] = 2;
+	qreq[2].addr = qbuf[2]; qreq[2].nbyte = 1024;
+	memset( qbuf[2], 0x3C, 1024);
+	for (i = 0; i < 3; ++i) { qreq[i].unit = 6; qreq[i].intr = qdone; }
+	mock_cmd_log_n = 0;
+	idequeue( 0, &qreq[0]);
+	idequeue( 0, &qreq[1]);
+	idequeue( 0, &qreq[2]);
+	CHECK( intr_calls == 0, "sync queued: nothing completes without interrupts");
+	CHECK( mock_cmd_count[0xE7] == 0, "sync queued: FLUSH not issued while the READ is on the cable");
+	pump();
+	CHECK( intr_calls == 3, "sync queued: READ, SYNC, WRITE all completed");
+	CHECK( qorder[0] == 0 && qorder[1] == 1 && qorder[2] == 2, "sync queued: completion order READ, SYNC, WRITE");
+	CHECK( mock_cmd_log_n == 3 && mock_cmd_log[0] == 0x20 && mock_cmd_log[1] == 0xE7 && mock_cmd_log[2] == 0x30,
+	       "sync queued: drive saw READ, FLUSH CACHE, WRITE in that order");
+	CHECK( qreq[1].okay && qreq[1].status == 0, "sync queued: SYNC GOOD");
+	CHECK( qreq[0].okay && qreq[0].status == 0 && disk_equals( 0, 90L, qbuf[0], 1024), "sync queued: READ data intact");
+	CHECK( qreq[2].okay && qreq[2].status == 0 && disk_equals( 0, 94L, qbuf[2], 1024), "sync queued: WRITE landed");
+	mock_fire_timeouts();				/* the armed watchdog tick finds nothing active */
+	CHECK( intr_calls == 3 && mock_timeouts_pending() == 0, "sync queued: watchdog tick idle, disarmed");
+	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after queued sync");
+
+	/* a drive without FLUSH CACHE: GOOD, no command, still through the queue */
+	fresh( 0);
+	mock_add_drive( 0, 4096L, "OLD DRIVE NO FLUSH", 0);
+	{ struct sdcom cp; tur( &cp, 6); run( &cp, 6, sync, 10, 0, 0);
+	  CHECK( cp.okay && cp.status == 0, "sync, no FLUSH support (interrupt mode): GOOD");
+	  CHECK( mock_cmd_count[0xE7] == 0, "sync, no FLUSH support: no command issued"); }
+
+	/* the FLUSH itself can time out like any queued command */
+	fresh( 1);
+	{ struct sdcom cp; unsigned char sense[18];
+	  tur( &cp, 6);
+	  mock_drv[0].mute_intrq = 1;
+	  ide_timeout_secs = 0;
+	  memset( &cp, 0, sizeof cp); memcpy( cp.cdb, sync, 10); cp.unit = 6; cp.intr = done;
+	  intr_calls = 0;
+	  idequeue( 0, &cp);
+	  pump();
+	  CHECK( intr_calls == 0 && mock_cmd_count[0xE7] == 1, "sync timeout: FLUSH issued, no interrupt yet");
+	  mock_fire_timeouts();
+	  CHECK( intr_calls == 1 && cp.okay && cp.status == 0x02, "sync timeout: watchdog completed it with CHECK CONDITION");
+	  mock_drv[0].mute_intrq = 0;
+	  ide_timeout_secs = 20;
+	  reqsense( &cp, 6, sense);
+	  CHECK( sense[2] == 0x04, "sync timeout: HARDWARE ERROR sense"); }
+}
+
+/*
+ * dd.c's completion order (iodone before the trailing startio) can submit
+ * the disk's one sdcom a second time while the first submission is still on
+ * the cable or queued.  The duplicate must be ignored, not linked in again.
+ */
+static struct sdcom	persist;
+static char		persistbuf[2][1024];
+
+static void
+persist_done( cp)
+struct sdcom	*cp;
+{
+	intr_calls++;
+	intr_last = cp;
+}
+
+static void
+test_persistent_sdcom_resubmit()
+{
+	struct sdcom	other;
+	static char	obuf[512];
+	int		i;
+
+	fresh( 1);
+	{ struct sdcom cp; tur( &cp, 6); }
+	intr_calls = 0; ide_dup_submits = 0;
+
+	/* 1. active: the same sdcom submitted again while its READ is on the cable */
+	memset( &persist, 0, sizeof persist);
+	persist.cdb[0] = 0x28; persist.cdb[5] = 60; persist.cdb[8] = 2;
+	persist.addr = persistbuf[0]; persist.nbyte = 1024; persist.unit = 6; persist.intr = persist_done;
+	idequeue( 0, &persist);
+	idequeue( 0, &persist);				/* duplicate while active */
+	CHECK( ide_dup_submits == 1, "resubmit while active: counted");
+	CHECK( intr_calls == 0, "resubmit while active: no completion yet");
+	pump();
+	CHECK( intr_calls == 1, "resubmit while active: completed exactly once");
+	CHECK( persist.okay && persist.status == 0 && disk_equals( 0, 60L, persistbuf[0], 1024),
+	       "resubmit while active: data intact");
+
+	/* 2. queued: behind another request, submitted twice before anything runs */
+	intr_calls = 0; ide_dup_submits = 0;
+	memset( &other, 0, sizeof other);
+	other.cdb[0] = 0x28; other.cdb[5] = 70; other.cdb[8] = 1;
+	other.addr = obuf; other.nbyte = 512; other.unit = 6; other.intr = persist_done;
+	memset( &persist, 0, sizeof persist);
+	persist.cdb[0] = 0x2A; persist.cdb[5] = 72; persist.cdb[8] = 2;	/* a WRITE: replaying it would be worst */
+	persist.addr = persistbuf[1]; persist.nbyte = 1024; persist.unit = 6; persist.intr = persist_done;
+	memset( persistbuf[1], 0x5A, 1024);
+	idequeue( 0, &other);
+	idequeue( 0, &persist);
+	idequeue( 0, &persist);				/* duplicate while queued */
+	idequeue( 0, &persist);				/* and again */
+	CHECK( ide_dup_submits == 2, "resubmit while queued: counted");
+	pump();
+	CHECK( intr_calls == 2, "resubmit while queued: both requests completed once each");
+	CHECK( persist.okay && persist.status == 0 && disk_equals( 0, 72L, persistbuf[1], 1024),
+	       "resubmit while queued: write landed once");
+	CHECK( mock_cmd_count[0x30] == 1, "resubmit while queued: WRITE issued to the drive once");
+	CHECK( mock_spl_calls == mock_splx_calls && mock_ipl == 0, "spl balanced after resubmits");
+
+	/* 3. after completion the same sdcom is a new request and must be honoured */
+	intr_calls = 0; ide_dup_submits = 0;
+	for (i = 0; i < 3; ++i) {
+		persist.cdb[0] = 0x28; persist.cdb[5] = (unsigned char)(80 + i); persist.cdb[8] = 1;
+		persist.addr = persistbuf[0]; persist.nbyte = 512; persist.intr = persist_done;
+		idequeue( 0, &persist);
+		pump();
+	}
+	CHECK( intr_calls == 3 && ide_dup_submits == 0, "sequential reuse of one sdcom: three completions, no dup");
+	CHECK( disk_equals( 0, 82L, persistbuf[0], 512), "sequential reuse: last read correct");
 }
 
 /* re-entrancy: dd.c starts the next request from inside the completion */
@@ -822,10 +1041,13 @@ main()
 	fprintf( stderr, "== test_slave_disabled_and_enabled\n"); test_slave_disabled_and_enabled();
 	fprintf( stderr, "== test_polled_timeout_does_not_hang\n"); test_polled_timeout_does_not_hang();
 	fprintf( stderr, "== test_watchdog\n"); test_watchdog();
+	fprintf( stderr, "== test_timeout_recovery\n"); test_timeout_recovery();
 	fprintf( stderr, "== test_nolba_drive_ignored\n"); test_nolba_drive_ignored();
 	fprintf( stderr, "== test_sync_cache\n"); test_sync_cache();
+	fprintf( stderr, "== test_sync_cache_queued\n"); test_sync_cache_queued();
 	fprintf( stderr, "== test_read6\n"); test_read6();
 	fprintf( stderr, "== test_queue_order\n"); test_queue_order();
+	fprintf( stderr, "== test_persistent_sdcom_resubmit\n"); test_persistent_sdcom_resubmit();
 	fprintf( stderr, "== test_reentrant_completion\n"); test_reentrant_completion();
 	fprintf( stderr, "== test_intr_not_mine\n"); test_intr_not_mine();
 	mock_free();
