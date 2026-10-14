@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * ide.c -- Amix (Commodore Amiga UNIX 2.1, SVR4 m68k) pseudo SCSI host adapter
- *          for the Gayle IDE port of the Amiga 4000 (and, through the board
- *          table, the A1200 and A600).
+ *          for the Gayle IDE port of the Amiga 4000.  (The board table also
+ *          carries A1200/A600 rows: untested, reachable only by ide_board_force.)
  *
  * Phase 2: interrupt-driven READ/WRITE (level 2, via int2_tbl[]) with a polled
- * fallback, PIO only, LBA28, master drive by default.
+ * fallback, PIO only, LBA28, master drive by default.  On the 68040/68060
+ * line (-DIDE_CACHE=1) the fallback is the only mode: int2_tbl[] there is a
+ * fixed table without ideintr (README, "The 68040/68060 kernel line").
  *
  * Copyright (c) 2026 Emre Bastuz.  See ../LICENSE.
  *
@@ -29,7 +31,9 @@
  *  - Kernel virtual == physical (sys/immu.h: phystokv(p) == p), so PIO copies
  *    go straight to cp->addr.  Requests are <= NBPP (2048) bytes for raw I/O
  *    and 8 KB (UFS block) from the buffer cache, physically contiguous, exactly
- *    as the stock DMA host adapters receive them.
+ *    as the stock DMA host adapters receive them.  A raw request that crosses
+ *    a page boundary is the one shape whose second page is not guaranteed to
+ *    follow the first; ide_pagecross_n counts those (IDE_NBPP).
  *  - sdspl is spl2 (sd.h).  Level-2 handlers (int2_tbl[] in master.d/kernel.c,
  *    walked by amiga/ml/ttrap.s p2int for every INT2 after it clears the
  *    INTREQ PORTS bit) run at IPL 2, so idequeue()'s spl2 bracket and ideintr()
@@ -82,10 +86,13 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
  * described in the board table.
  *
  * Kernel virtual == physical for these ranges (sys/immu.h: phystokv(p) == p;
- * the low 1 GB is identity mapped through the 030 transparent translation
+ * the low 1 GB is identity mapped through the transparent translation
  * registers), so the driver dereferences plain addresses.  Cache inhibition
- * of the ranges is assumed from the TT registers (works on the real
- * A4000; the TT0/TT1 CI bits themselves are not yet read back).
+ * of these ranges on the 68030 is assumed from the transparent-translation
+ * registers (works on the real A4000; the TT0/TT1 CI bits themselves are not
+ * yet read back); on the 68040/68060 line DTT0 (0x003fc060, pstart040.s)
+ * covers them cache-inhibited for supervisor data, which an IDE_CACHE build
+ * checks at attach (see "68040/68060 data cache" below).
  */
 /* Base addresses live in the board table (struct ideboard) -- never here. */
 #define IDE_SPAN	0x101BL		/* bytes from a task-file base to the last register + 1 */
@@ -103,6 +110,15 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
 #define IDE_REG_ALTSTAT	0x101A		/* R   (does not clear INTRQ) */
 #define IDE_REG_CONTROL	0x101A		/*   W device control */
 
+/* the same registers under their ATAPI names (ATA/ATAPI-4 9.10) */
+#define IDE_REG_IREASON	IDE_REG_NSECT	/* R   interrupt reason */
+#define IDE_REG_BCLO	IDE_REG_LCYL	/* R/W byte count 7:0  */
+#define IDE_REG_BCHI	IDE_REG_HCYL	/* R/W byte count 15:8 */
+#define IDE_IR_COD	0x01		/* 1: the DRQ phase moves the command packet */
+#define IDE_IR_IO	0x02		/* 1: device to host */
+#define IDE_ATAPI_SIGLO	0x14		/* LCYL/HCYL after an ATAPI device aborts IDENTIFY */
+#define IDE_ATAPI_SIGHI	0xEB
+
 #define IDE_IRQ_IDE	0x80		/* Gayle IRQ status: IDE interrupt pending */
 
 /*
@@ -110,7 +126,8 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
  * 0x20/0x30, AGA Alice 0x22/0x23/0x32/0x33 -- bit 4 (0x10) is the video
  * standard, the low nibble is >= 2 only for Alice.  (Testing "id >= 0x22", as
  * some sources do, misclassifies an NTSC ECS machine, id 0x30, as AGA.)
- * Verified against the Amiberry/WinUAE VPOSR model; [verify] on real hardware.
+ * Verified against the Amiberry/WinUAE VPOSR model and on a real PAL A4000
+ * (2026-10-10: VPOSR 0xA300, id 0x23).
  */
 #define IDE_VPOSR_ADDR	0xDFF004L
 #define IDE_VPOSR_ID( v)	(((v) >> 8) & 0x7F)
@@ -150,11 +167,14 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
 #define IDE_CMD_RECAL		0x10
 #define IDE_CMD_READ		0x20	/* READ SECTOR(S) with retry */
 #define IDE_CMD_WRITE		0x30	/* WRITE SECTOR(S) with retry */
+#define IDE_CMD_VERIFY		0x40	/* READ VERIFY SECTOR(S) with retry: no data */
 #define IDE_CMD_READMULT	0xC4
 #define IDE_CMD_WRITEMULT	0xC5
 #define IDE_CMD_SETMULT		0xC6
 #define IDE_CMD_FLUSH		0xE7	/* FLUSH CACHE (ATA-4+, optional) */
 #define IDE_CMD_IDENTIFY	0xEC
+#define IDE_CMD_PACKET		0xA0	/* ATAPI: a SCSI-style command packet follows */
+#define IDE_CMD_PIDENTIFY	0xA1	/* ATAPI: IDENTIFY PACKET DEVICE */
 #define IDE_CMD_SETFEATURES	0xEF
 
 /* IDENTIFY DEVICE words (ATA-2 8.12) */
@@ -172,6 +192,11 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
 #define IDE_ID_CAPS_LBA		0x0200
 #define IDE_ID_CMDSET2_FLUSH	0x1000
 #define IDE_ID_CMDSET2_VALID	0xC000	/* bit 15 clear, bit 14 set => word valid */
+/* IDENTIFY PACKET DEVICE word 0 (ATA/ATAPI-4 8.13) */
+#define IDE_PID_ATAPI_MASK	0xC000	/* bits 15:14 == 10b: an ATAPI device */
+#define IDE_PID_ATAPI		0x8000
+#define IDE_PID_TYPE( w)	(((w) >> 8) & 0x1F)	/* SCSI peripheral type, 5 = CD-ROM */
+#define IDE_PID_PKT16( w)	(((w) & 0x03) == 0x01)	/* 16-byte packets, else 12 */
 
 #define IDE_SECTOR	512
 #define IDE_MAXSECT	256		/* per READ/WRITE SECTOR(S) command (NSECT 0 == 256) */
@@ -221,15 +246,33 @@ extern void	(*int2_tbl[])();	/* master.d/kernel.c, NULL terminated */
  * status read plus loop overhead; on a 25 MHz 68030 that is on the order of a
  * microsecond, so the defaults allow several seconds.  [verify] calibrate on
  * the real machine; plain globals so the kernel debugger can change them.
+ *
+ * The loop is bus bound: the status read is a motherboard cycle of fixed
+ * length whatever the CPU, and only the loop overhead shrinks on a faster
+ * one.  An IDE_CACHE (68040/68060) build therefore scales the budgets by
+ * IDE_SPIN_SCALE (4), which keeps the wall-clock floor at or above the 030's
+ * for any per-iteration speed-up up to 4x.  ide_spins_hw records the most
+ * iterations a successful wait has needed (a real 68060 A4000: 2765).
  */
-ulong	ide_spins       = 2000000L;	/* BSY/DRQ wait inside a polled command */
-ulong	ide_spins_reset = 8000000L;	/* BSY wait after reset / for FLUSH CACHE */
-ulong	ide_spins_short = 200000L;	/* DRQ wait inside the interrupt path */
+#ifndef IDE_SPIN_SCALE
+#if IDE_CACHE
+#define IDE_SPIN_SCALE	4L
+#else
+#define IDE_SPIN_SCALE	1L
+#endif
+#endif
+ulong	ide_spins       = 2000000L * IDE_SPIN_SCALE;	/* BSY/DRQ wait inside a polled command */
+ulong	ide_spins_reset = 8000000L * IDE_SPIN_SCALE;	/* BSY wait after reset / for FLUSH CACHE */
+ulong	ide_spins_short = 200000L * IDE_SPIN_SCALE;	/* DRQ wait inside the interrupt path */
+ulong	ide_spins_hw;			/* high-water: iterations a successful wait needed */
 
-int	ide_slave_enable = 0;		/* 0: never touch the slave (FlashAir rule) */
+int	ide_slave_enable = 0;		/* 0: never touch the slave (FlashAir rule),
+					 * 1: attach whatever answers there,
+					 * 2: attach it only if it is an ATAPI device (a CD-ROM) */
 int	ide_intr_enable  = 1;		/* 0: force polled I/O even if hooked */
-int	ide_board_force  = 0;		/* 0 auto-detect, 1.. = ideboards[] index+1, -1 = never probe */
+int	ide_board_force  = 0;		/* 0 auto-detect (A4000 only), 1.. = ideboards[] index+1, -1 = never probe */
 ulong	ide_timeout_secs = 20;		/* watchdog for an interrupt-driven command */
+ulong	ide_spins_atapi = 20000000L * IDE_SPIN_SCALE;	/* polled ATAPI phase wait (spin-up, seek) */
 int	ide_debug        = 0;		/* 0 quiet, 1 attach/errors, 2 every command */
 
 /*
@@ -242,7 +285,17 @@ int	ide_debug        = 0;		/* 0 quiet, 1 attach/errors, 2 every command */
 int	ide_master_unit = 6;
 int	ide_slave_unit  = 5;
 
-#define IDE_DATA_SWAP	0		/* 1 if sector data must be byte swapped [verify] */
+/*
+ * Kernel page size, for the page-crossing check on raw requests: 2048 on the
+ * 68030 kernel, 4096 on the 68040/68060 line (build with -DIDE_NBPP=4096).
+ */
+#ifndef IDE_NBPP
+#define IDE_NBPP	2048L
+#endif
+ulong	ide_pagecross_n;		/* raw (<= IDE_NBPP) requests spanning two pages */
+
+#define IDE_DATA_SWAP	0		/* 1 if sector data must be byte swapped; 0 confirmed by the
+					 * 2026-09-27 A4000 boot (root mounted, files intact) */
 
 /* ------------------------------------------------------ register seam */
 
@@ -252,6 +305,162 @@ int	ide_slave_unit  = 5;
 #define RW( a)		(*(volatile ushort *)(a))
 #define WW( a, v)	(*(volatile ushort *)(a) = (ushort)(v))
 #endif
+
+/* -------------------------------------------- 68040/68060 data cache */
+
+/*
+ * Built only with -DIDE_CACHE=1, for the 68040/68060 kernel line; the 68030
+ * object contains none of it.
+ *
+ * PIO is done by the CPU, but not through a cached alias: the driver stores
+ * and loads the buffer at cp->addr, a physical address dereferenced through
+ * the low identity range, which DTT0 makes cache-inhibited for supervisor
+ * data.  The same physical page can sit in the copyback data cache under
+ * another alias -- a raw-I/O buffer is a user page, and user pages are
+ * copyback on this line.  A WRITE would then send RAM that is older than the
+ * dirty line, and a READ would leave stale lines that are later read, or
+ * evicted over the fresh sectors.  So every buffer is pushed and invalidated
+ * (CPUSHL + CINVL, by physical line: one op covers every alias) before the
+ * transfer, and a READ's buffer again after it.  CINVL follows each CPUSHL
+ * because the 68060 leaves a pushed line valid when CACR.DPI is set.  The
+ * range rounds outward to 16-byte lines; push-before-invalidate never
+ * discards a neighbour's dirty bytes in the edge lines.  The same sequence as
+ * amix-z3660scsi (BLIZZARD F3), with the raw words verified there:
+ *   f468 = cpushl dc,(a0)   f448 = cinvl dc,(a0)   4e71 = nop
+ *   4e7a 0006 / 0007 / 0002 = movec dtt0 / dtt1 / cacr,d0
+ *
+ * Ordering: DTT0 is cache-inhibited NONSERIALIZED, so with the 68060 store
+ * buffer enabled a task-file read could overtake a buffered write (a status
+ * poll ahead of the COMMAND write that it is meant to follow).  TR() issues a
+ * NOP first, which waits for pending writes.  [verify] against the MC68060UM
+ * before the store buffer is turned on; with it off the NOP costs a few
+ * cycles next to a motherboard bus cycle.
+ *
+ * ide_cache (kmem) turns the line operations off for an A/B run; the NOP and
+ * the attach-time check stay.
+ */
+#if IDE_CACHE
+long	ide_cache = 1;			/* 0: no line operations (A/B only) */
+ulong	ide_push_n, ide_push_bytes;	/* push+invalidate passes, bytes covered */
+ulong	ide_dtt0, ide_dtt1, ide_cacr;	/* captured at attach */
+ulong	ide_ci_ok;			/* 0 not checked, 1 task file cache-inhibited, 2 NOT */
+
+#ifndef HOST_TEST
+#define IDE_CPUSHL( p)	__asm__ __volatile__( ".word 0xf468" : : "a" (p) : "memory")
+#define IDE_CINVL( p)	__asm__ __volatile__( ".word 0xf448" : : "a" (p) : "memory")
+#define IDE_SYNC()	__asm__ __volatile__( ".word 0x4e71" : : : "memory")
+#define IDE_LINEPTR	register uchar *p __asm__("a0")
+
+static ulong
+ide_rd_dtt0()
+{
+	register ulong	v __asm__("d0");
+
+	__asm__ __volatile__( ".word 0x4e7a,0x0006" : "=d" (v));
+	return v;
+}
+
+static ulong
+ide_rd_dtt1()
+{
+	register ulong	v __asm__("d0");
+
+	__asm__ __volatile__( ".word 0x4e7a,0x0007" : "=d" (v));
+	return v;
+}
+
+static ulong
+ide_rd_cacr()
+{
+	register ulong	v __asm__("d0");
+
+	__asm__ __volatile__( ".word 0x4e7a,0x0002" : "=d" (v));
+	return v;
+}
+#else	/* HOST_TEST: mock_regs.h routes IDE_CPUSHL/IDE_CINVL/IDE_SYNC and the
+	 * control-register reads into the harness */
+#define IDE_LINEPTR	uchar *p
+#define ide_rd_dtt0()	mock_dtt0
+#define ide_rd_dtt1()	mock_dtt1
+#define ide_rd_cacr()	mock_cacr
+#endif	/* HOST_TEST */
+
+/* Push and invalidate every data-cache line covering [pa, pa + len). */
+static void
+ide_cache_push( pa, len)
+ulong	pa, len;
+{
+	IDE_LINEPTR;
+	ulong	end;
+
+	if (ide_cache == 0 || pa == 0 || len == 0 || pa + len < pa)
+		return;
+	p   = (uchar *)(pa & ~15L);
+	end = (pa + len + 15) & ~15L;
+	while ((ulong)p < end) {
+		IDE_CPUSHL( p);
+		IDE_CINVL( p);
+		p += 16;
+	}
+	ide_push_n++;
+	ide_push_bytes += len;
+}
+
+/*
+ * Classify a transparent-translation register against one address for
+ * supervisor data: 0 does not cover it, 1 covers it cache-inhibited, 2 covers
+ * it cached.  Layout (040 and 060): 31-24 base, 23-16 mask, 15 E, 14-13 S,
+ * 6-5 CM (0 writethrough, 1 copyback, 2/3 cache-inhibited).
+ */
+static int
+ide_ttr_class( t, a)
+ulong	t, a;
+{
+	ulong	base, mask;
+
+	if ((t & 0x8000) == 0 || ((t >> 13) & 3) == 0)	/* disabled, or user only */
+		return 0;
+	base = (t >> 24) & 0xFF;
+	mask = (t >> 16) & 0xFF;
+	if ((((a >> 24) & 0xFF) & ~mask) != (base & ~mask))
+		return 0;
+	return ((t >> 5) & 3) >= 2 ? 1 : 2;
+}
+
+/*
+ * Attach-time check that the board's registers are reached cache-inhibited:
+ * a cached status register would never change.  Both ends of the span are
+ * tested (TTR granularity is 16 MB).  An address no TTR covers fails too: it
+ * would go through page tables whose cache mode the driver cannot see.  The
+ * driver carries on either way -- refusing the root disk would only hide the
+ * message -- but says so on the console.
+ */
+static void
+ide_ci_check( lo, hi)
+ulong	lo, hi;				/* lo inclusive, hi exclusive */
+{
+	ulong	a;
+	int	i, c0, c1;
+
+	ide_dtt0 = ide_rd_dtt0();
+	ide_dtt1 = ide_rd_dtt1();
+	ide_cacr = ide_rd_cacr();
+	ide_ci_ok = 1;
+	for (i = 0; i < 2; ++i) {
+		a  = i ? hi - 1 : lo;
+		c0 = ide_ttr_class( ide_dtt0, a);
+		c1 = ide_ttr_class( ide_dtt1, a);
+		if (c0 == 2 || c1 == 2 || (c0 == 0 && c1 == 0)) {
+			ide_ci_ok = 2;
+			printf( "ide: 0x%x is NOT cache-inhibited (dtt0 0x%x dtt1 0x%x cacr 0x%x)\n",
+				(int)a, (int)ide_dtt0, (int)ide_dtt1, (int)ide_cacr);
+		}
+	}
+}
+#else	/* !IDE_CACHE: the 68030 line has no copyback data cache to maintain */
+#define IDE_SYNC()
+#define ide_cache_push( pa, len)
+#endif	/* IDE_CACHE */
 
 /* ------------------------------------------------------------ boards */
 
@@ -266,8 +475,11 @@ int	ide_slave_unit  = 5;
  *          (bit 7 must be set to route IDE to INT2).  Gayle ID 0xD1.
  *   A600   as the A1200 but ECS chipset and Gayle ID 0xD0.
  * The Gayle ID is read bit-serially from 0xDE1000 (write resets, then eight
- * reads deliver the bits, MSB first, in bit 7).  [verify] on real hardware
- * that 0xDE1000 reads harmlessly on an A4000/A3000 (Gary decodes 0xDExxxx).
+ * reads deliver the bits, MSB first, in bit 7).  It is consulted ONLY when
+ * the operator names an A1200/A600 row through ide_board_force: 0xDExxxx is
+ * Gary/Fat Gary space on an A3000/A4000, and the automatic probe must not
+ * write there.  Automatic detection is A4000-only (chipset gate + task-file
+ * readback); the A1200/A600 rows are untested and never auto-selected.
  */
 struct ideboard {
 	char	*name;
@@ -291,7 +503,18 @@ static struct ideboard	ideboards[] = {
 static struct ideboard	*ide_bd;	/* the detected board, NULL until then */
 
 /* task-file access relative to the board base */
+#if IDE_CACHE
+static __inline__ int
+ide_tr( o)
+ulong	o;
+{
+	IDE_SYNC();			/* earlier task-file writes land first */
+	return RB( ide_bd->base + o);
+}
+#define TR( o)		ide_tr( (ulong)(o))
+#else
 #define TR( o)		RB( ide_bd->base + (o))
+#endif
 #define TW( o, v)	WB( ide_bd->base + (o), (v))
 #define TRW()		RW( ide_bd->base + IDE_REG_DATA)
 #define TWW( v)		WW( ide_bd->base + IDE_REG_DATA, (v))
@@ -347,7 +570,11 @@ ide_gayle_id()
 #define IDE_MODEL_LEN	40
 
 struct ideunit {
-	bool	present;		/* IDENTIFY succeeded, LBA usable */
+	bool	present;		/* IDENTIFY succeeded, LBA usable (or an ATAPI device) */
+	bool	atapi;			/* packet device: CDBs go to the drive as they are */
+	uchar	devtype;		/* ATAPI: SCSI peripheral type (5 = CD-ROM) */
+	uchar	pktlen;			/* ATAPI: command packet length, 12 or 16 */
+	bool	synth;			/* the pending sense is ours, not the drive's */
 	bool	flush;			/* FLUSH CACHE supported (IDENTIFY word 83 bit 12) */
 	ulong	nsectors;		/* LBA28 sector count */
 	ushort	multi;			/* IDENTIFY word 47 low byte (informational) */
@@ -365,6 +592,12 @@ static int		ide_use_intr;	/* attach(): ideintr is in int2_tbl[] and enabled */
 
 /* interrupt-path bookkeeping (kmem-readable) */
 ulong	ide_intr_count, ide_intr_spurious, ide_intr_timeouts;
+ulong	ide_intr_busy;		/* interrupts taken with the drive still BSY */
+ulong	ide_dup_submits;	/* requests re-submitted while active or queued (ignored) */
+ulong	ide_resets;		/* software resets issued after a timeout */
+ulong	ide_atapi_cmds;		/* ATAPI packet commands issued */
+ulong	ide_atapi_overrun;	/* ATAPI bytes the drive sent beyond nbyte (dropped) */
+ulong	ide_atapi_irlate;	/* polled ATAPI ends accepted without IREASON CoD|IO */
 
 /* --------------------------------------------------- low-level helpers */
 
@@ -381,10 +614,16 @@ ulong	spins;
 {
 	int	st;
 
+	ulong	n;
+
+	n = spins;
 	do {
 		st = TR( IDE_REG_STATUS);
-		if ((st & mask) == want)
+		if ((st & mask) == want) {
+			if (n - spins > ide_spins_hw)
+				ide_spins_hw = n - spins;
 			return st;
+		}
 	} while (spins-- != 0);
 	return -1;
 }
@@ -395,11 +634,16 @@ ide_wait_drq( spins)
 ulong	spins;
 {
 	int	st;
+	ulong	n;
 
+	n = spins;
 	do {
 		st = TR( IDE_REG_STATUS);
-		if (!(st & IDE_ST_BSY) && (st & (IDE_ST_DRQ | IDE_ST_ERR | IDE_ST_DF)))
+		if (!(st & IDE_ST_BSY) && (st & (IDE_ST_DRQ | IDE_ST_ERR | IDE_ST_DF))) {
+			if (n - spins > ide_spins_hw)
+				ide_spins_hw = n - spins;
 			return st;
+		}
 	} while (spins-- != 0);
 	return -1;
 }
@@ -432,6 +676,7 @@ int		skey, asc, ascq;
 	u->skey = skey;
 	u->asc  = asc;
 	u->ascq = ascq;
+	u->synth = TRUE;
 	u->errors++;
 }
 
@@ -446,7 +691,9 @@ int		st, write;
 	er = TR( IDE_REG_ERROR);
 	u->laststat = st;
 	u->lasterr  = er;
-	if (er & IDE_ER_IDNF)
+	if (!(st & IDE_ST_ERR))			/* DF alone: the ERROR register is stale */
+		ide_setsense( u, SK_HARDWARE, ASC_INTERNAL_FAILURE, 0);
+	else if (er & IDE_ER_IDNF)
 		ide_setsense( u, SK_ILLEGAL, ASC_LBA_OUT_OF_RANGE, 0);
 	else if (er & (IDE_ER_UNC | IDE_ER_BBK | IDE_ER_AMNF))
 		ide_setsense( u, SK_MEDIUM, write ? ASC_WRITE_ERROR : ASC_READ_ERROR, 0);
@@ -505,12 +752,13 @@ int	nwords;
  * the little-endian ATA words byte swapped relative to the 68k's view, so
  * every IDENTIFY word is swapped once: numeric fields become correct and the
  * ASCII strings (first character in bits 15:8 per ATA-2) come out in order.
- * Verified in the emulator (model string and sector count decode correctly);
- * [verify] on real hardware.  Sector data needs no swap (IDE_DATA_SWAP 0).
+ * Verified in the emulator and on the real A4000 (2026-09-27: model string
+ * and sector count decode correctly).  Sector data needs no swap
+ * (IDE_DATA_SWAP 0).
  */
 static int
-ide_identify( drive, id)
-int	drive;
+ide_identify( drive, id, cmd)
+int	drive, cmd;		/* IDE_CMD_IDENTIFY, or IDE_CMD_PIDENTIFY for a packet device */
 ushort	*id;
 {
 	int	st, i;
@@ -518,7 +766,7 @@ ushort	*id;
 
 	if (ide_select( drive) < 0)
 		return -1;
-	TW( IDE_REG_COMMAND, IDE_CMD_IDENTIFY);
+	TW( IDE_REG_COMMAND, cmd);
 	ide_settle();
 	st = ide_wait( IDE_ST_BSY, 0, ide_spins);
 	if (st < 0 || (st & IDE_ST_ERR) || !(st & IDE_ST_DRQ))
@@ -530,20 +778,81 @@ ushort	*id;
 	return 0;
 }
 
+/*
+ * Sectors per MB for the attach banner.  A variable, not the constant 2048:
+ * the 68040/68060 relink pass rejects any shift by 11 (the 030 page shift)
+ * in a linked object, and /2048 compiles to exactly that.
+ */
+static ulong	ide_secs_per_mb = 1048576L / IDE_SECTOR;
+
+/* IDENTIFY words 27..46: the model string, two characters per word */
+static void
+ide_model( u, id)
+struct ideunit	*u;
+ushort		*id;
+{
+	char	*m;
+	int	i;
+
+	m = u->model;
+	for (i = 0; i < IDE_MODEL_LEN / 2; ++i) {
+		*m++ = id[IDE_ID_MODEL + i] >> 8;
+		*m++ = id[IDE_ID_MODEL + i] & 0xFF;
+	}
+	*m = '\0';
+	while (m > u->model && m[-1] == ' ')	/* trim trailing blanks */
+		*--m = '\0';
+}
+
+/*
+ * An ATAPI device (a CD-ROM): IDENTIFY PACKET DEVICE gives its type and
+ * packet length.  It has no capacity of its own here -- the caller's READ
+ * CAPACITY goes to the drive like every other CDB.
+ */
+static void
+ide_attach_atapi( drive, u, id)
+int		drive;
+struct ideunit	*u;
+ushort		*id;
+{
+	if (ide_identify( drive, id, IDE_CMD_PIDENTIFY) < 0
+	    || (id[0] & IDE_PID_ATAPI_MASK) != IDE_PID_ATAPI) {
+		printf( "ide%d: ATAPI signature but no IDENTIFY PACKET DEVICE, ignored\n", drive);
+		return;
+	}
+	u->atapi   = TRUE;
+	u->devtype = IDE_PID_TYPE( id[0]);
+	u->pktlen  = IDE_PID_PKT16( id[0]) ? 16 : 12;
+	u->nsectors = 0;
+	u->flush   = FALSE;
+	ide_model( u, id);
+	u->present = TRUE;
+	printf( "ide%d: %s, ATAPI %s\n", drive, u->model,
+		u->devtype == 5 ? "CD-ROM" : "device");
+}
+
 static void
 ide_attach_unit( drive)
 int	drive;
 {
 	static ushort	id[IDE_SECTOR / 2];	/* static: kernel stacks are small */
 	struct ideunit	*u;
-	int		i;
-	char		*m;
 
 	u = &ideunits[drive];
 	u->present = FALSE;
-	if (ide_identify( drive, id) < 0) {
+	u->atapi = FALSE;
+	if (ide_identify( drive, id, IDE_CMD_IDENTIFY) < 0) {
+		/* a packet device aborts IDENTIFY DEVICE and leaves its signature */
+		if (TR( IDE_REG_LCYL) == IDE_ATAPI_SIGLO && TR( IDE_REG_HCYL) == IDE_ATAPI_SIGHI) {
+			ide_attach_atapi( drive, u, id);
+			return;
+		}
 		if (ide_debug)
 			printf( "ide%d: no drive\n", drive);
+		return;
+	}
+	if (drive == 1 && ide_slave_enable == 2) {
+		printf( "ide1: ATA device on the slave ignored (ide_slave_enable 2: ATAPI only)\n");
 		return;
 	}
 	if (!(id[IDE_ID_CAPS] & IDE_ID_CAPS_LBA)) {
@@ -556,17 +865,10 @@ int	drive;
 	u->multi = id[IDE_ID_MULTI] & 0xFF;
 	u->flush = ((id[IDE_ID_CMDSET2] & IDE_ID_CMDSET2_VALID) == 0x4000
 		    && (id[IDE_ID_CMDSET2] & IDE_ID_CMDSET2_FLUSH)) ? TRUE : FALSE;
-	m = u->model;
-	for (i = 0; i < IDE_MODEL_LEN / 2; ++i) {
-		*m++ = id[IDE_ID_MODEL + i] >> 8;
-		*m++ = id[IDE_ID_MODEL + i] & 0xFF;
-	}
-	*m = '\0';
-	while (m > u->model && m[-1] == ' ')	/* trim trailing blanks */
-		*--m = '\0';
+	ide_model( u, id);
 	u->present = TRUE;
 	printf( "ide%d: %s, %d sectors (%d MB)\n", drive, u->model,
-		(int)u->nsectors, (int)(u->nsectors / 2048));
+		(int)u->nsectors, (int)(u->nsectors / ide_secs_per_mb));
 }
 
 /* Is ideintr in the kernel's level-2 table?  (NULL-terminated, kernel.c.) */
@@ -589,6 +891,9 @@ ide_attach()
 
 	ide_attached = 1;
 	ide_use_intr = 0;
+#if IDE_CACHE
+	ide_ci_check( ide_bd->base, ide_bd->base + IDE_SPAN);
+#endif
 	TW( IDE_REG_CONTROL, IDE_CTL_NIEN);		/* quiet during the polled attach */
 	for (drive = 0; drive < IDE_NDRIVES; ++drive)
 		if (drive == 0 || ide_slave_enable)
@@ -604,12 +909,41 @@ ide_attach()
 	printf( "ide: %s, %s I/O\n", ide_bd->name, ide_use_intr ? "interrupt" : "polled");
 }
 
+/*
+ * Software reset of the cable after a command timed out.  The drive may
+ * still be executing the abandoned command and would otherwise complete it
+ * -- interrupt, data and all -- into whatever request comes next.  SRST
+ * (held for well over the 5 us ATA-2 asks) aborts it on both drives; then
+ * BSY is waited out (bounded), STATUS is read to drop a pending INTRQ, the
+ * Gayle latch is acknowledged where there is one, and interrupt enable is
+ * restored to the attach-time setting.  No SET FEATURES state is lost: the
+ * driver sets none.
+ */
+static void
+ide_reset_drive()
+{
+	int	i, st;
+
+	ide_resets++;
+	TW( IDE_REG_CONTROL, IDE_CTL_SRST | IDE_CTL_NIEN);
+	for (i = 0; i < 16; ++i)
+		(void) TR( IDE_REG_ALTSTAT);
+	TW( IDE_REG_CONTROL, IDE_CTL_NIEN);
+	ide_settle();
+	st = ide_wait( IDE_ST_BSY, 0, ide_spins_reset);
+	(void) TR( IDE_REG_STATUS);
+	ide_irq_ack( ide_bd);
+	TW( IDE_REG_CONTROL, ide_use_intr ? 0 : IDE_CTL_NIEN);
+	if (ide_debug)
+		printf( "ide: drive reset after timeout, status 0x%x\n", st);
+}
+
 /* --------------------------------------------------------- polled I/O */
 
-/* Program the task file for `n' sectors at `lba' and issue the command. */
+/* Program the task file for `n' sectors at `lba' and issue ATA command `cmd'. */
 static void
-ide_program( drive, write, lba, n)
-int	drive, write;
+ide_program( drive, cmd, lba, n)
+int	drive, cmd;
 ulong	lba, n;
 {
 	TW( IDE_REG_NSECT, n & 0xFF);			/* 256 -> 0 */
@@ -618,8 +952,44 @@ ulong	lba, n;
 	TW( IDE_REG_HCYL, (lba >> 16) & 0xFF);
 	TW( IDE_REG_SDH,   IDE_SDH_FIXED | IDE_SDH_LBA
 			 | (drive ? IDE_SDH_DRV1 : 0) | ((lba >> 24) & IDE_SDH_HEAD));
-	TW( IDE_REG_COMMAND, write ? IDE_CMD_WRITE : IDE_CMD_READ);
+	TW( IDE_REG_COMMAND, cmd);
 	ide_settle();
+}
+
+/*
+ * Polled READ VERIFY SECTOR(S): the drive reads and checks `nsect' sectors
+ * from `lba' without transferring them.  Returns 0 or -1 (sense set).
+ */
+static int
+ide_verify_polled( u, drive, lba, nsect)
+struct ideunit	*u;
+int		drive;
+ulong		lba, nsect;
+{
+	ulong	chunk;
+	int	st;
+
+	while (nsect > 0) {
+		chunk = nsect > IDE_MAXSECT ? IDE_MAXSECT : nsect;
+		st = ide_select( drive);
+		if (st < 0 || !(st & IDE_ST_DRDY)) {
+			ide_setsense( u, SK_NOT_READY, ASC_LUN_NOT_READY, 0);
+			return -1;
+		}
+		ide_program( drive, IDE_CMD_VERIFY, lba, chunk);
+		st = ide_wait( IDE_ST_BSY, 0, ide_spins);
+		if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
+			if (st < 0) {
+				ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+				ide_reset_drive();
+			} else
+				ide_ataerror( u, st, 0);
+			return -1;
+		}
+		lba   += chunk;
+		nsect -= chunk;
+	}
+	return 0;
 }
 
 /*
@@ -645,7 +1015,7 @@ ulong		nbyte;
 			ide_setsense( u, SK_NOT_READY, ASC_LUN_NOT_READY, 0);
 			return -1;
 		}
-		ide_program( drive, write, lba, chunk);
+		ide_program( drive, write ? IDE_CMD_WRITE : IDE_CMD_READ, lba, chunk);
 		for (n = 0; n < (int)chunk; ++n) {
 			st = ide_wait_drq( ide_spins);
 			if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
@@ -654,6 +1024,7 @@ ulong		nbyte;
 					ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
 					if (ide_debug)
 						printf( "ide%d: timeout, status 0x%x\n", drive, u->laststat);
+					ide_reset_drive();
 				} else
 					ide_ataerror( u, st, write);
 				return -1;
@@ -669,9 +1040,10 @@ ulong		nbyte;
 		}
 		st = ide_wait( IDE_ST_BSY, 0, ide_spins);
 		if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
-			if (st < 0)
+			if (st < 0) {
 				ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
-			else
+				ide_reset_drive();
+			} else
 				ide_ataerror( u, st, write);
 			return -1;
 		}
@@ -698,8 +1070,10 @@ int		drive;
 	if (st < 0 || (st & IDE_ST_ERR)) {
 		if (st >= 0)
 			ide_ataerror( u, st, 1);
-		else
+		else {
+			ide_reset_drive();
 			ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+		}
 		return -1;
 	}
 	return 0;
@@ -718,7 +1092,7 @@ int		drive;
 static struct sdcom	*ide_cq[IDE_CQ];
 static uint		ide_cq_head, ide_cq_tail;
 static int		ide_completing;
-ulong			ide_cq_overflow;	/* must stay 0 */
+ulong			ide_cq_overflow;	/* completions delivered nested because the FIFO was full */
 
 static void
 ide_complete( cp)
@@ -730,9 +1104,11 @@ struct sdcom	*cp;
 
 	s = sdspl();
 	nt = (ide_cq_tail + 1) & (IDE_CQ - 1);
-	if (nt == ide_cq_head) {
-		ide_cq_overflow++;
+	if (nt == ide_cq_head) {		/* full: deliver now rather than lose it */
+		if (ide_cq_overflow++ == 0)
+			printf( "ide: completion queue full, delivering directly\n");
 		splx( s);
+		(*cp->intr)( cp);
 		return;
 	}
 	ide_cq[ide_cq_tail] = cp;
@@ -765,18 +1141,45 @@ static struct sdcom	*ide_qhead, *ide_qtail, *ide_active;
 static struct {
 	struct ideunit	*u;
 	int		drive, write;
+	int		nodata;		/* 0: READ/WRITE; else the ATA command that moves no data
+				 * (FLUSH CACHE, READ VERIFY) -- one interrupt per command */
+	ulong		cmdn;		/* sectors covered by the current no-data command */
 	ulong		lba;		/* next LBA to issue / transfer */
 	ulong		left;		/* sectors of the request not yet transferred */
 	ulong		cmdleft;	/* sectors still to move in the current ATA command */
 	uchar		*data;
 	ulong		nbyte, done;
+	ulong		gen;		/* bumped per started request: the watchdog counts ticks per gen */
+	int		atapi;		/* the request is an ATAPI packet command */
+	uchar		pkt[16];	/* ATAPI: the command packet */
 } ide_x;
 static int	ide_watch_armed;
-static ulong	ide_watch_ticks;
+static ulong	ide_watch_ticks, ide_watch_gen;
 
 static void	ide_start();
 static void	ide_watchdog();
+static void	ide_watch_arm();
+static void	ide_reset_drive();
 int		idepresent();
+
+/* Is cp on the cable or waiting for it?  (dd.c can hand us the same sdcom
+ * twice: its completion routine calls iodone() before it starts the next
+ * buffer, and iodone's callback may resubmit the disk's single sdcom while
+ * the first submission is still in flight.  Linking it again would make the
+ * queue eat its own tail.) */
+static int
+ide_pending( cp)
+struct sdcom	*cp;
+{
+	struct sdcom	*p;
+
+	if (cp == ide_active)
+		return 1;
+	for (p = ide_qhead; p; p = (struct sdcom *)p->next)
+		if (p == cp)
+			return 1;
+	return 0;
+}
 
 static void
 ide_enqueue( cp)
@@ -803,6 +1206,228 @@ ide_dequeue()
 		cp->next = 0;
 	}
 	return cp;
+}
+
+/* ------------------------------------------------ ATAPI packet commands */
+
+/*
+ * An ATAPI device (a CD-ROM) takes the caller's SCSI CDB itself, as a 12-
+ * or 16-byte packet after the PACKET command; the data then moves in DRQ
+ * phases whose direction (IREASON) and length (byte count) the device
+ * chooses.  The same step function runs polled (ide_atapi_polled loops to
+ * the end) and from ideintr() (one phase per interrupt).  READ(6)/WRITE(6),
+ * which MMC devices do not implement, become READ(10)/WRITE(10); everything
+ * else goes as it is, so INQUIRY, READ CAPACITY and REQUEST SENSE are the
+ * drive's own answers and a CHECK CONDITION leaves the real sense in the
+ * drive for the caller's REQUEST SENSE.  Bytes the drive sends beyond nbyte
+ * are drained and counted (ide_atapi_overrun), never stored.
+ */
+
+/* Build ide_x.pkt from the CDB; bytes past the CDB's group length are zero. */
+static void
+ide_atapi_packet( c)
+uchar	*c;
+{
+	uchar	*p;
+	ulong	lba, cnt;
+	int	i, n;
+
+	p = ide_x.pkt;
+	for (i = 0; i < 16; ++i)
+		p[i] = 0;
+	if (c[0] == SC_READ6 || c[0] == SC_WRITE6) {
+		lba = ((ulong)(c[1] & 0x1F) << 16) | ((ulong)c[2] << 8) | c[3];
+		cnt = c[4] ? c[4] : 256;
+		p[0] = c[0] == SC_READ6 ? SC_READ10 : SC_WRITE10;
+		p[3] = lba >> 16; p[4] = lba >> 8; p[5] = lba;
+		p[7] = cnt >> 8;  p[8] = cnt;
+		p[9] = c[5];
+		return;
+	}
+	switch (c[0] >> 5) {			/* SCSI-2 group code */
+	case 0:  n = 6;  break;
+	case 1:
+	case 2:  n = 10; break;
+	default: n = 12; break;
+	}
+	for (i = 0; i < n; ++i)
+		p[i] = c[i];
+}
+
+/* Describe cp as the ATAPI transfer in ide_x. */
+static void
+ide_atapi_setup( cp, drive)
+struct sdcom	*cp;
+int		drive;
+{
+	ide_x.atapi  = 1;
+	ide_x.drive  = drive;
+	ide_x.u      = &ideunits[drive];
+	ide_x.write  = 0;			/* the device picks the direction per phase */
+	ide_x.nodata = 0;
+	ide_x.cmdleft = 0;
+	ide_x.left   = 0;
+	ide_x.data   = (uchar *)cp->addr;
+	ide_x.nbyte  = cp->nbyte;
+	ide_x.done   = 0;
+	ide_atapi_packet( cp->cdb);
+}
+
+/*
+ * One step with the device not busy: move a DRQ phase, or finish.  Returns
+ * 1 (more phases follow), 0 (done, GOOD) or -1 (CHECK CONDITION).
+ */
+static int
+ide_atapi_step( st)
+int	st;
+{
+	struct ideunit	*u;
+	ulong		n, i, end, from;
+	ushort		w;
+	uchar		*d;
+	int		ir;
+
+	u = ide_x.u;
+	if (!(st & IDE_ST_DRQ)) {
+		if (st & IDE_ST_ERR) {		/* the drive holds the sense; key in ERROR 7:4 */
+			u->laststat = st;
+			u->lasterr  = TR( IDE_REG_ERROR);
+			u->skey     = u->lasterr >> 4;
+			u->errors++;
+			return -1;
+		}
+		if (st & IDE_ST_DF) {
+			ide_setsense( u, SK_HARDWARE, ASC_INTERNAL_FAILURE, 0);
+			return -1;
+		}
+		return 0;
+	}
+	ir = TR( IDE_REG_IREASON);
+	n  = TR( IDE_REG_BCLO) | ((ulong)TR( IDE_REG_BCHI) << 8);
+	if ((ir & IDE_IR_COD) || n == 0) {	/* a packet phase again, or nothing to move */
+		u->laststat = st;
+		ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+		ide_reset_drive();
+		return -1;
+	}
+	d = ide_x.data;
+	from = ide_x.done;
+	for (i = 0; i < n; i += 2) {
+		end = from + i;
+		if (ir & IDE_IR_IO) {
+			w = TRW();
+			if (end < ide_x.nbyte)
+				d[end] = w >> 8;
+			if (i + 1 < n && end + 1 < ide_x.nbyte)
+				d[end + 1] = w;
+		} else {
+			w = 0;
+			if (end < ide_x.nbyte)
+				w = (ushort)d[end] << 8;
+			if (i + 1 < n && end + 1 < ide_x.nbyte)
+				w |= d[end + 1];
+			TWW( w);
+		}
+	}
+	end = from + n;
+	if (end > ide_x.nbyte)
+		ide_atapi_overrun += end - (from > ide_x.nbyte ? from : ide_x.nbyte);
+	ide_x.done = end;
+	ide_settle();
+	return 1;
+}
+
+/*
+ * PACKET, then the command packet once the device asks for it.  Returns 0
+ * with the command running, or -1 (sense set or held by the drive).
+ */
+static int
+ide_atapi_issue()
+{
+	struct ideunit	*u;
+	ulong		bc;
+	int		st, i;
+
+	u = ide_x.u;
+	ide_atapi_cmds++;
+	if (ide_select( ide_x.drive) < 0) {
+		ide_setsense( u, SK_NOT_READY, ASC_LUN_NOT_READY, 0);
+		return -1;
+	}
+	bc = (ide_x.nbyte + 1) & ~1L;		/* byte count limit per DRQ phase */
+	if (bc == 0 || bc > 0xFFFE)
+		bc = 0xFFFE;
+	TW( IDE_REG_FEATURE, 0);		/* PIO, no overlap */
+	TW( IDE_REG_IREASON, 0);
+	TW( IDE_REG_BCLO, bc & 0xFF);
+	TW( IDE_REG_BCHI, (bc >> 8) & 0xFF);
+	TW( IDE_REG_COMMAND, IDE_CMD_PACKET);
+	ide_settle();
+	st = ide_wait_drq( ide_spins);
+	if (st < 0) {
+		ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+		ide_reset_drive();
+		return -1;
+	}
+	if (!(st & IDE_ST_DRQ)) {		/* PACKET itself refused (ERR or DF) */
+		(void) ide_atapi_step( st);
+		return -1;
+	}
+	if ((TR( IDE_REG_IREASON) & (IDE_IR_COD | IDE_IR_IO)) != IDE_IR_COD) {
+		ide_setsense( u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+		ide_reset_drive();
+		return -1;
+	}
+	for (i = 0; i < u->pktlen; i += 2)
+		TWW( ((ushort)ide_x.pkt[i] << 8) | ide_x.pkt[i + 1]);
+	ide_settle();
+	return 0;
+}
+
+/*
+ * The whole command, polled.  0 GOOD, -1 CHECK CONDITION.
+ *
+ * Polling sees states an interrupt never shows.  BSY and DRQ clear with no
+ * error is the end of the command only in the status phase, where IREASON
+ * reads CoD|IO (ATA/ATAPI-4 9.10); Amiberry's ATAPI model passes through
+ * BSY=0/DRQ=0 with IREASON still CoD while it prepares the data, and taking
+ * that as the end completed reads with nothing transferred.  A device that
+ * never sets CoD|IO at the end is accepted after ide_spins_short quiet reads
+ * (ide_atapi_irlate counts those).
+ */
+static int
+ide_atapi_polled( cp, drive)
+struct sdcom	*cp;
+int		drive;
+{
+	ulong	quiet;
+	int	st, r;
+
+	ide_atapi_setup( cp, drive);
+	if (ide_atapi_issue() < 0)
+		return -1;
+	quiet = 0;
+	for (;;) {
+		st = ide_wait( IDE_ST_BSY, 0, ide_spins_atapi);
+		if (st < 0) {
+			ide_x.u->laststat = TR( IDE_REG_ALTSTAT);
+			ide_setsense( ide_x.u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+			if (ide_debug)
+				printf( "ide%d: ATAPI timeout, status 0x%x\n", drive, ide_x.u->laststat);
+			ide_reset_drive();
+			return -1;
+		}
+		if (!(st & (IDE_ST_DRQ | IDE_ST_ERR | IDE_ST_DF))
+		    && (TR( IDE_REG_IREASON) & (IDE_IR_COD | IDE_IR_IO)) != (IDE_IR_COD | IDE_IR_IO)) {
+			if (quiet++ < ide_spins_short)
+				continue;		/* not the status phase yet */
+			ide_atapi_irlate++;
+		}
+		quiet = 0;
+		r = ide_atapi_step( st);
+		if (r <= 0)
+			return r;
+	}
 }
 
 /* Copy one sector of the active transfer and advance the counters. */
@@ -835,6 +1460,8 @@ int	err;
 	ide_active = 0;
 	ide_watch_ticks = 0;
 	if (cp) {
+		if (!ide_x.write && !ide_x.nodata)
+			ide_cache_push( (ulong)cp->addr, (ulong)cp->nbyte);	/* lines refetched meanwhile */
 		cp->status = err ? SC_CHECK : SC_GOOD;
 		cp->okay   = TRUE;
 		ide_complete( cp);		/* may re-enter idequeue(): it just enqueues */
@@ -844,9 +1471,11 @@ int	err;
 }
 
 /*
- * Issue the next ATA command of the active transfer.  A write must be primed
+ * Issue the next ATA command of the active request.  A write must be primed
  * with its first sector before the drive interrupts; a read interrupts as soon
- * as the first sector is ready.
+ * as the first sector is ready; a no-data command (FLUSH CACHE, READ VERIFY)
+ * interrupts once, when done (ideintr() sees cmdleft == 0, accounts for the
+ * sectors it covered and finishes or issues the next chunk).
  */
 static void
 ide_issue()
@@ -854,6 +1483,10 @@ ide_issue()
 	ulong	n;
 	int	st;
 
+	if (ide_x.nodata == IDE_CMD_FLUSH && !ide_x.u->flush) {	/* old drive: nothing to flush */
+		ide_finish( 0);
+		return;
+	}
 	n = ide_x.left > IDE_MAXSECT ? IDE_MAXSECT : ide_x.left;
 	st = ide_select( ide_x.drive);
 	if (st < 0 || !(st & IDE_ST_DRDY)) {
@@ -861,8 +1494,18 @@ ide_issue()
 		ide_finish( -1);
 		return;
 	}
-	ide_x.cmdleft = n;
-	ide_program( ide_x.drive, ide_x.write, ide_x.lba, n);
+	if (ide_x.nodata) {
+		ide_x.cmdleft = 0;
+		ide_x.cmdn = n;
+		if (ide_x.nodata == IDE_CMD_FLUSH) {
+			TW( IDE_REG_COMMAND, IDE_CMD_FLUSH);
+			ide_settle();
+		} else
+			ide_program( ide_x.drive, ide_x.nodata, ide_x.lba, n);
+	} else {
+		ide_x.cmdleft = n;
+		ide_program( ide_x.drive, ide_x.write ? IDE_CMD_WRITE : IDE_CMD_READ, ide_x.lba, n);
+	}
 	if (ide_x.write) {
 		st = ide_wait_drq( ide_spins_short);
 		if (st < 0 || (st & (IDE_ST_ERR | IDE_ST_DF))) {
@@ -875,6 +1518,12 @@ ide_issue()
 		}
 		ide_xfer_sector();
 	}
+	ide_watch_arm();
+}
+
+static void
+ide_watch_arm()
+{
 	if (!ide_watch_armed) {
 		ide_watch_armed = 1;
 		timeout( ide_watchdog, (char *)0, HZ);
@@ -891,11 +1540,26 @@ ide_start()
 	if (cp == 0)
 		return;
 	ide_active = cp;
-	ide_watch_ticks = 0;
+	ide_x.gen++;
+	if (ideunits[(int)cp->unit == ide_master_unit ? 0 : 1].atapi) {
+		ide_atapi_setup( cp, (int)cp->unit == ide_master_unit ? 0 : 1);
+		if (ide_atapi_issue() < 0)
+			ide_finish( -1);
+		else
+			ide_watch_arm();
+		return;
+	}
+	ide_x.atapi = 0;
 	/* the transfer description is rebuilt from the CDB, so queued requests
 	 * need no side storage beyond cp->next */
 	ide_x.write = (cp->cdb[0] == SC_WRITE10 || cp->cdb[0] == SC_WRITE6);
-	if (cp->cdb[0] == SC_READ6 || cp->cdb[0] == SC_WRITE6) {
+	ide_x.nodata = cp->cdb[0] == SC_SYNC_CACHE ? IDE_CMD_FLUSH
+		     : cp->cdb[0] == SC_VERIFY10   ? IDE_CMD_VERIFY : 0;
+	ide_x.cmdn = 0;
+	if (ide_x.nodata == IDE_CMD_FLUSH) {
+		ide_x.lba  = 0;
+		ide_x.left = 0;
+	} else if (cp->cdb[0] == SC_READ6 || cp->cdb[0] == SC_WRITE6) {
 		ide_x.lba  = ((ulong)(cp->cdb[1] & 0x1F) << 16) | ((ulong)cp->cdb[2] << 8) | cp->cdb[3];
 		ide_x.left = cp->cdb[4] ? cp->cdb[4] : 256;
 	} else {
@@ -919,7 +1583,7 @@ ide_start()
 void
 ideintr()
 {
-	int	st;
+	int	st, i;
 
 	if (ide_bd == 0 || ide_state != 2 || !ide_irq_pending( ide_bd))
 		return;
@@ -930,8 +1594,16 @@ ideintr()
 		ide_intr_spurious++;
 		return;
 	}
-	if (st & IDE_ST_BSY)			/* not for us yet; the drive will interrupt again */
+	if (st & IDE_ST_BSY) {			/* not for us yet; the drive will interrupt again */
+		ide_intr_busy++;
 		return;
+	}
+	if (ide_x.atapi) {			/* one DRQ phase, or the end of the command */
+		i = ide_atapi_step( st);
+		if (i <= 0)
+			ide_finish( i);
+		return;
+	}
 	if (st & (IDE_ST_ERR | IDE_ST_DF)) {
 		ide_ataerror( ide_x.u, st, ide_x.write);
 		ide_finish( -1);
@@ -963,6 +1635,10 @@ ideintr()
 		ide_finish( -1);
 		return;
 	}
+	if (ide_x.nodata) {			/* the command covered cmdn sectors */
+		ide_x.lba  += ide_x.cmdn;
+		ide_x.left  = ide_x.left > ide_x.cmdn ? ide_x.left - ide_x.cmdn : 0;
+	}
 	if (ide_x.left > 0)
 		ide_issue();
 	else
@@ -981,11 +1657,16 @@ ide_watchdog()
 
 	s = sdspl();
 	if (ide_active) {
+		if (ide_watch_gen != ide_x.gen) {	/* a new request since the last tick */
+			ide_watch_gen = ide_x.gen;
+			ide_watch_ticks = 0;
+		}
 		if (++ide_watch_ticks > ide_timeout_secs) {
 			ide_intr_timeouts++;
 			ide_x.u->laststat = TR( IDE_REG_STATUS);
 			printf( "ide%d: command timed out (status 0x%x)\n", ide_x.drive, ide_x.u->laststat);
 			ide_setsense( ide_x.u, SK_HARDWARE, ASC_LU_COMM_FAILURE, 0);
+			ide_reset_drive();		/* quiet cable before the next request starts */
 			ide_finish( -1);
 		}
 	}
@@ -1036,12 +1717,20 @@ struct sdcom	*cp;
 	int		drive, write, s, i;
 
 	s = sdspl();
+	if (ide_pending( cp)) {			/* already in flight: it completes once, later */
+		ide_dup_submits++;
+		if (ide_debug)
+			printf( "ide: request re-submitted while in flight, ignored\n");
+		splx( s);
+		return TRUE;
+	}
 	if (ide_state == 0) {			/* sd.c probes first; be robust anyway */
 		char	*pa;
 		(void) idepresent( &pa);
 	}
 	if (ide_state == 2 && !ide_attached)
 		ide_attach();
+	ide_cache_push( (ulong)cp->addr, (ulong)cp->nbyte);	/* before the CPU reads or fills it */
 
 	drive = ide_drive_of( cp->unit);
 	data  = (uchar *)cp->addr;
@@ -1060,12 +1749,73 @@ struct sdcom	*cp;
 	if (ide_debug > 1)
 		printf( "ide%d: unit %d cdb 0x%x nbyte %d\n", drive, (int)cp->unit, op, cp->nbyte);
 
+	if (cp->cdb[1] & 0xE0) {		/* a LUN other than 0: there is none */
+		if (op == SC_INQUIRY) {		/* SCSI-2 8.2.5.1: qualifier 011b, type 1Fh */
+			if (data && cp->nbyte) {
+				ide_zero( data, cp->nbyte);
+				data[0] = 0x7F;
+			}
+		} else {
+			ide_setsense( u, SK_ILLEGAL, ASC_LUN_NOT_SUPPORTED, 0);
+			cp->status = SC_CHECK;
+		}
+		splx( s);
+		ide_complete( cp);
+		return TRUE;
+	}
+
+	/* ATAPI: the drive executes the CDB (our own sense, if pending, first) */
+	if (u->atapi && !(op == SC_REQ_SENSE && u->synth)) {
+		u->synth = FALSE;
+		if (ide_use_intr) {
+			ide_enqueue( cp);
+			if (ide_active == 0)
+				ide_start();
+			splx( s);
+			return TRUE;		/* completes from ideintr() */
+		}
+		if (ide_atapi_polled( cp, drive) < 0)
+			cp->status = SC_CHECK;
+		ide_cache_push( (ulong)data, (ulong)cp->nbyte);
+		splx( s);
+		ide_complete( cp);
+		return TRUE;
+	}
+
 	switch (op) {
 	case SC_TUR:
 	case SC_REZERO:
 	case SC_START_STOP:
-	case SC_VERIFY10:
 	case SC_MODE_SELECT6:
+		break;
+
+	case SC_VERIFY10:
+		/* READ VERIFY SECTOR(S): the drive checks the sectors, no data
+		 * moves.  BYTCHK (compare against supplied data) is not offered. */
+		if (cp->cdb[1] & 0x02) {
+			ide_setsense( u, SK_ILLEGAL, ASC_INVALID_CDB_FIELD, 0);
+			cp->status = SC_CHECK;
+			break;
+		}
+		lba  = ((ulong)cp->cdb[2] << 24) | ((ulong)cp->cdb[3] << 16)
+		     | ((ulong)cp->cdb[4] << 8)  | cp->cdb[5];
+		nblk = ((ulong)cp->cdb[7] << 8) | cp->cdb[8];
+		if (nblk == 0)
+			break;				/* nothing to verify: GOOD */
+		if (lba >= u->nsectors || nblk > u->nsectors - lba) {
+			ide_setsense( u, SK_ILLEGAL, ASC_LBA_OUT_OF_RANGE, 0);
+			cp->status = SC_CHECK;
+			break;
+		}
+		if (ide_use_intr) {
+			ide_enqueue( cp);
+			if (ide_active == 0)
+				ide_start();
+			splx( s);
+			return TRUE;		/* completes from ideintr() */
+		}
+		if (ide_verify_polled( u, drive, lba, nblk) < 0)
+			cp->status = SC_CHECK;
 		break;
 
 	case SC_REQ_SENSE:
@@ -1078,6 +1828,7 @@ struct sdcom	*cp;
 			if (n > 12) data[12] = u->asc;
 			if (n > 13) data[13] = u->ascq;
 			u->skey = u->asc = u->ascq = 0;	/* consumed on read */
+			u->synth = FALSE;
 		}
 		break;
 
@@ -1127,6 +1878,17 @@ struct sdcom	*cp;
 		break;
 
 	case SC_SYNC_CACHE:
+		/* Interrupt mode: take the queue like a transfer, so the flush
+		 * runs after the writes queued before it and never overwrites
+		 * the task file of a command in flight.  Polled mode has
+		 * nothing in flight and flushes inline. */
+		if (ide_use_intr) {
+			ide_enqueue( cp);
+			if (ide_active == 0)
+				ide_start();
+			splx( s);
+			return TRUE;		/* completes from ideintr() */
+		}
 		if (ide_flush( u, drive) < 0)
 			cp->status = SC_CHECK;
 		break;
@@ -1154,7 +1916,12 @@ struct sdcom	*cp;
 			cp->status = SC_CHECK;
 			break;
 		}
-		if (nblk == 0 || lba + nblk > u->nsectors) {
+		if ((ulong)cp->nbyte <= IDE_NBPP
+		    && (((ulong)data ^ ((ulong)data + cp->nbyte - 1)) & ~(IDE_NBPP - 1))) {
+			if (ide_pagecross_n++ == 0 || ide_debug)
+				printf( "ide: raw request of %d bytes crosses a page boundary\n", cp->nbyte);
+		}
+		if (nblk == 0 || lba >= u->nsectors || nblk > u->nsectors - lba) {
 			ide_setsense( u, SK_ILLEGAL, ASC_LBA_OUT_OF_RANGE, 0);
 			cp->status = SC_CHECK;
 			break;
@@ -1168,6 +1935,8 @@ struct sdcom	*cp;
 		}
 		if (ide_rw_polled( u, drive, write, lba, nblk, data, (ulong)cp->nbyte) < 0)
 			cp->status = SC_CHECK;
+		if (!write)
+			ide_cache_push( (ulong)data, (ulong)cp->nbyte);
 		break;
 
 	default:
@@ -1185,8 +1954,27 @@ struct sdcom	*cp;
 
 /*
  * Write two distinct values to the master's sector count / sector number
- * registers at `base' and read them back.  Open bus or a missing drive does
- * not hold both.  Leaves the drive with interrupts disabled.
+ * registers and read them back.  Open bus or a missing drive does not hold
+ * both.  Caller has set ide_bd.
+ */
+static int
+ide_readback_regs()
+{
+	TW( IDE_REG_NSECT, 0x55);
+	TW( IDE_REG_SECT,  0xAA);
+	if (TR( IDE_REG_NSECT) != 0x55 || TR( IDE_REG_SECT) != 0xAA)
+		return 0;
+	TW( IDE_REG_NSECT, 0xAA);
+	TW( IDE_REG_SECT,  0x55);
+	return TR( IDE_REG_NSECT) == 0xAA && TR( IDE_REG_SECT) == 0x55;
+}
+
+/*
+ * Is a drive answering at the board's task file?  The readback runs first,
+ * so a port with nothing attached (open bus, status reads 0xFF) is settled in
+ * a dozen accesses.  Only when the registers do not hold AND the status shows
+ * a drive still busy (power-on reset, not 0xFF) is BSY waited out, bounded,
+ * and the readback retried.  Leaves the drive with interrupts disabled.
  */
 static int
 ide_readback( bd)
@@ -1198,29 +1986,28 @@ struct ideboard	*bd;
 	TW( IDE_REG_CONTROL, IDE_CTL_NIEN);
 	TW( IDE_REG_SDH, IDE_SDH_FIXED | IDE_SDH_LBA);
 	ide_settle();
-	st = ide_wait( IDE_ST_BSY, 0, ide_spins_reset);
-	ok = 0;
-	TW( IDE_REG_NSECT, 0x55);
-	TW( IDE_REG_SECT,  0xAA);
-	if (TR( IDE_REG_NSECT) == 0x55 && TR( IDE_REG_SECT) == 0xAA) {
-		TW( IDE_REG_NSECT, 0xAA);
-		TW( IDE_REG_SECT,  0x55);
-		if (TR( IDE_REG_NSECT) == 0xAA && TR( IDE_REG_SECT) == 0x55 && st >= 0)
-			ok = 1;
+	ok = ide_readback_regs();
+	if (!ok) {
+		st = TR( IDE_REG_ALTSTAT);
+		if (st != 0xFF && (st & IDE_ST_BSY)) {
+			st = ide_wait( IDE_ST_BSY, 0, ide_spins_reset);
+			if (st >= 0)
+				ok = ide_readback_regs();
+		}
 	}
 	ide_bd = 0;
 	return ok;
 }
 
 /*
- * Board detection.  Order matters: no task-file address is touched before a
- * gate says a controller can be there.
- *  1. AGA chipset (VPOSR) and a drive answering at the A4000 base -> A4000.
- *  2. Otherwise the Gayle ID register names an A1200 (0xD1) or A600 (0xD0)
- *     Gayle, confirmed by the chipset and a readback at the A1200 base.
- *  3. Nothing -> no controller (A3000, A2000 ...).
- * ide_board_force bypasses the gates (still readback-verified) or, at -1,
- * keeps the driver from probing at all.
+ * Board detection.  The automatic probe knows the A4000 only, and no address
+ * outside the custom chips is touched before a gate says a controller can be
+ * there: read VPOSR; on an AGA chipset look for a drive answering at the
+ * A4000 task file; anything else (A3000, A2000 ...) is "no controller" after
+ * that single VPOSR read.  The A1200/A600 rows are reached only through
+ * ide_board_force (1.. = row): the row's Gayle ID, where it has one, is then
+ * confirmed at 0xDE1000 -- the one place that register is ever read -- and
+ * the readback still has to succeed.  -1 keeps the driver from probing at all.
  */
 static struct ideboard *
 ide_detect()
@@ -1228,27 +2015,27 @@ ide_detect()
 	struct ideboard	*bd;
 	ushort		vposr;
 	uint		id;
-	int		aga, i;
 
 	if (ide_board_force < 0)
 		return 0;
 	if (ide_board_force > 0 && ide_board_force <= IDE_NBOARDS) {
 		bd = &ideboards[ide_board_force - 1];
+		if (bd->gayleid) {
+			id = ide_gayle_id();
+			if (id != bd->gayleid) {
+				if (ide_debug)
+					printf( "ide: forced %s but Gayle id is 0x%x, not 0x%x\n",
+						bd->name, id, bd->gayleid);
+				return 0;
+			}
+		}
 		return ide_readback( bd) ? bd : 0;
 	}
 	vposr = RW( IDE_VPOSR_ADDR);
-	aga = IDE_VPOSR_IS_AGA( vposr);
-	if (aga && ide_readback( &ideboards[0]))
+	if (IDE_VPOSR_IS_AGA( vposr) && ide_readback( &ideboards[0]))
 		return &ideboards[0];
-	id = ide_gayle_id();
-	for (i = 1; i < IDE_NBOARDS; ++i) {
-		bd = &ideboards[i];
-		if (bd->gayleid == id && bd->aga == aga && ide_readback( bd))
-			return bd;
-	}
 	if (ide_debug)
-		printf( "ide: no Gayle IDE (VPOSR id 0x%x, Gayle id 0x%x)\n",
-			IDE_VPOSR_ID( vposr), id);
+		printf( "ide: no Gayle IDE (VPOSR id 0x%x)\n", IDE_VPOSR_ID( vposr));
 	return 0;
 }
 

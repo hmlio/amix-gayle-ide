@@ -42,9 +42,33 @@ unsigned short		mock_vposr_value;
 int			mock_vposr_override;
 unsigned long		mock_accesses, mock_bad_accesses, mock_taskfile_accesses, mock_slave_selects;
 unsigned long		mock_cmd_count[256], mock_irq_acks, mock_id_reads;
+unsigned long		mock_srst_count;
 int			mock_last_cmd = -1;
+int			mock_cmd_log[64];
+int			mock_cmd_log_n;
 int			mock_nien, mock_intrq, mock_irq_latch;
 unsigned char		mock_intena;
+
+/* CPU-side model for the IDE_CACHE build: an access sequence number, the
+ * span of DATA-register accesses, task-file reads that could overtake an
+ * unsynchronised write, and a log of data-cache line operations. */
+unsigned long		mock_bsy_reads;		/* STATUS reads that still show BSY */
+unsigned char		mock_pkt_log[64];
+int			mock_pkt_log_n;
+unsigned		mock_pkt_bc;
+unsigned char		mock_pkt_last[16];
+unsigned char		mock_atapi_out[256];
+unsigned		mock_atapi_out_n;
+unsigned long		mock_seq;
+unsigned long		mock_data_first, mock_data_last;	/* seq of DATA accesses, 0 = none */
+unsigned long		mock_order_violations;
+static int		wr_pending;
+unsigned long		mock_dtt0 = 0x003fc060L;	/* pstart040.s */
+unsigned long		mock_dtt1 = 0x807fa060L;
+unsigned long		mock_cacr = 0x80008000L;
+struct mock_lineop	mock_lineops[MOCK_LINEOPS];
+int			mock_nlineops;
+unsigned long		mock_lineops_lost;
 
 /* task file (shared by both drives, as on the real cable) */
 static unsigned char	r_nsect, r_sect, r_lcyl, r_hcyl, r_sdh, r_error, r_control;
@@ -54,8 +78,18 @@ static int		id_cnt;			/* Gayle ID serial read position */
 
 /* data phase */
 static unsigned char	xbuf[MOCK_SECTOR];
-static int		xidx, xmode;		/* xmode: 0 idle, 1 read, 2 write */
+static int		xidx, xmode;		/* xmode: 0 idle, 1 read, 2 write, 3 ATAPI packet,
+						 * 4 ATAPI data in, 5 ATAPI data out */
 static unsigned long	xlba, xleft;
+
+/* ATAPI phases */
+#define ABUF	(64 * 1024)
+static unsigned char	abuf[ABUF];		/* response (in) or received data (out) */
+static unsigned		alen, apos, aphase;	/* total, done, left in this DRQ phase */
+static unsigned char	pktbuf[16];
+static int		pidx;
+static unsigned		pkt_bc;
+static int		glitch_left;		/* see mock_drive.glitch */
 
 static struct mock_drive *
 cur()
@@ -78,10 +112,21 @@ has_gayle()
 void
 mock_reset()
 {
+	mock_bsy_reads = 0;
+	mock_data_first = mock_data_last = 0;
+	mock_order_violations = 0;
+	wr_pending = 0;
+	mock_nlineops = 0;
+	mock_lineops_lost = 0;
+	mock_dtt0 = 0x003fc060L;
+	mock_dtt1 = 0x807fa060L;
+	mock_cacr = 0x80008000L;
 	memset( mock_cmd_count, 0, sizeof mock_cmd_count);
 	mock_accesses = mock_bad_accesses = mock_taskfile_accesses = mock_slave_selects = 0;
 	mock_irq_acks = mock_id_reads = 0;
 	mock_last_cmd = -1;
+	mock_srst_count = 0;
+	mock_cmd_log_n = 0;
 	mock_nien = 1;				/* ATA default after reset: interrupts off? no -- 0.  Driver sets it. */
 	mock_nien = 0;
 	mock_intrq = mock_irq_latch = 0;
@@ -92,6 +137,9 @@ mock_reset()
 	r_status[0] = r_status[1] = ST_DRDY | ST_DSC;
 	sel = 0; id_cnt = 0;
 	xmode = 0; xidx = 0; xlba = xleft = 0;
+	alen = apos = aphase = 0; pidx = 0; glitch_left = 0;
+	mock_pkt_log_n = 0; mock_pkt_bc = 0; mock_atapi_out_n = 0;
+	memset( mock_pkt_last, 0, sizeof mock_pkt_last);
 }
 
 void
@@ -101,6 +149,7 @@ mock_free()
 
 	for (i = 0; i < 2; ++i) {
 		free( mock_drv[i].disk);
+		free( mock_drv[i].cd);
 		memset( &mock_drv[i], 0, sizeof mock_drv[i]);
 	}
 }
@@ -115,15 +164,40 @@ const char	*model;
 	unsigned long		i;
 
 	free( d->disk);
+	free( d->cd);
 	memset( d, 0, sizeof *d);
 	d->present  = 1;
 	d->nsectors = nsectors;
 	d->flush    = flush;
-	d->unc_lba  = -1;
+	d->unc_lba  = -1; d->df_lba  = -1;
 	strncpy( d->model, model, 40);
 	d->disk = malloc( nsectors * MOCK_SECTOR);
 	for (i = 0; i < nsectors * MOCK_SECTOR; ++i)	/* recognisable pattern */
 		d->disk[i] = (unsigned char)((i / MOCK_SECTOR) * 7 + (i % MOCK_SECTOR));
+}
+
+/* An ATAPI CD-ROM with `blocks' 2048-byte blocks of a recognisable pattern. */
+void
+mock_add_cdrom( unit, blocks, model)
+int		unit;
+unsigned long	blocks;
+const char	*model;
+{
+	struct mock_drive	*d = &mock_drv[unit];
+	unsigned long		i;
+
+	free( d->disk);
+	free( d->cd);
+	memset( d, 0, sizeof *d);
+	d->present   = 1;
+	d->atapi     = 1;
+	d->cd_blocks = blocks;
+	d->unc_lba   = -1; d->df_lba = -1;
+	strncpy( d->model, model, 40);
+	d->cd = malloc( blocks * MOCK_CD_BLOCK);
+	for (i = 0; i < blocks * MOCK_CD_BLOCK; ++i)
+		d->cd[i] = (unsigned char)((i / MOCK_CD_BLOCK) * 13 + (i % MOCK_CD_BLOCK) * 3 + 1);
+	r_status[unit] = 0;			/* no DRDY: the driver must not need it */
 }
 
 unsigned long
@@ -230,10 +304,262 @@ load_sector()
 		fail( ER_UNC);
 		return;
 	}
+	if (d->df_lba >= 0 && (unsigned long)d->df_lba == xlba) {	/* device fault: ERROR register stale */
+		r_status[sel] = ST_DRDY | ST_DSC | ST_DF;
+		xmode = 0;
+		raise_intrq();
+		return;
+	}
 	memcpy( xbuf, d->disk + xlba * MOCK_SECTOR, MOCK_SECTOR);
 	xidx = 0;
 	r_status[sel] = ST_DRDY | ST_DSC | ST_DRQ;
 	raise_intrq();
+}
+
+/* --- ATAPI CD-ROM ---------------------------------------------------------
+ * PACKET: DRQ with IREASON = CoD for the packet; then data phases of at most
+ * the host's byte count limit (or d->chunk), IREASON = IO for data in, 0 for
+ * data out, each announced by INTRQ; completion IREASON = CoD|IO, DRQ clear,
+ * INTRQ.  Failure: ERR with the sense key in ERROR 7:4, sense held for
+ * REQUEST SENSE.  Status never shows DRDY.
+ */
+#define IR_COD	0x01
+#define IR_IO	0x02
+
+static void
+atapi_done( d)
+struct mock_drive	*d;
+{
+	xmode = 0;
+	r_nsect = d->no_ir3 ? IR_IO : IR_COD | IR_IO;
+	r_status[sel] = ST_DSC;
+	raise_intrq();
+}
+
+static void
+atapi_check( d, skey, asc)
+struct mock_drive	*d;
+int			skey, asc;
+{
+	d->skey = skey;
+	d->asc  = asc;
+	r_error = (skey << 4) | ER_ABRT;
+	xmode = 0;
+	r_nsect = IR_COD | IR_IO;
+	r_status[sel] = ST_DSC | ST_ERR;
+	raise_intrq();
+}
+
+/* start the next DRQ phase, or complete */
+static void
+atapi_phase( d)
+struct mock_drive	*d;
+{
+	unsigned	n;
+
+	if (apos >= alen) {
+		atapi_done( d);
+		return;
+	}
+	n = alen - apos;
+	if (n > pkt_bc)
+		n = pkt_bc;
+	if (d->chunk && n > d->chunk)
+		n = d->chunk;
+	aphase = n;
+	r_lcyl = n & 0xFF;
+	r_hcyl = (n >> 8) & 0xFF;
+	r_nsect = xmode == 4 ? IR_IO : 0;
+	r_status[sel] = ST_DSC | ST_DRQ;
+	raise_intrq();
+}
+
+static void
+atapi_data_in( d, src, n, alloc)
+struct mock_drive	*d;
+const unsigned char	*src;
+unsigned		n, alloc;
+{
+	if (n > alloc)
+		n = alloc;
+	if (n > ABUF)
+		n = ABUF;
+	memcpy( abuf, src, n);
+	alen = n; apos = 0;
+	xmode = 4;
+	atapi_phase( d);
+}
+
+static void
+atapi_packet( d)
+struct mock_drive	*d;
+{
+	unsigned char	*p = pktbuf, r[36];
+	unsigned long	lba, cnt;
+	unsigned	alloc;
+
+	memcpy( mock_pkt_last, pktbuf, 16);
+	glitch_left = d->glitch;
+	if (mock_pkt_log_n < 64)
+		mock_pkt_log[mock_pkt_log_n++] = p[0];
+	if (d->hang_on_pkt) {
+		d->hang_on_pkt = 0;
+		d->hung = 1;
+		mock_intrq = 0;
+		xmode = 0;
+		return;
+	}
+	switch (p[0]) {
+	case 0x00:				/* TEST UNIT READY */
+		if (d->no_medium) { atapi_check( d, 2, 0x3A); return; }
+		atapi_done( d);
+		return;
+	case 0x03:				/* REQUEST SENSE */
+		memset( r, 0, sizeof r);
+		r[0] = 0x70; r[2] = d->skey; r[7] = 10; r[12] = d->asc;
+		d->skey = d->asc = 0;
+		atapi_data_in( d, r, 18, p[4]);
+		return;
+	case 0x12:				/* INQUIRY */
+		memset( r, ' ', sizeof r);
+		r[0] = 0x05; r[1] = 0x80; r[2] = 0x00; r[3] = 0x21; r[4] = 31;
+		r[5] = r[6] = r[7] = 0;
+		memcpy( r + 8, "MOCK    ", 8);
+		memcpy( r + 16, "ATAPI CD-ROM    ", 16);
+		memcpy( r + 32, "1.00", 4);
+		atapi_data_in( d, r, 36, p[4]);
+		return;
+	case 0x25:				/* READ CAPACITY(10) */
+		if (d->no_medium) { atapi_check( d, 2, 0x3A); return; }
+		lba = d->cd_blocks - 1;
+		r[0] = lba >> 24; r[1] = lba >> 16; r[2] = lba >> 8; r[3] = lba;
+		r[4] = 0; r[5] = 0; r[6] = MOCK_CD_BLOCK >> 8; r[7] = 0;
+		atapi_data_in( d, r, 8, 8);
+		return;
+	case 0x28:				/* READ(10) */
+		if (d->no_medium) { atapi_check( d, 2, 0x3A); return; }
+		lba = ((unsigned long)p[2] << 24) | ((unsigned long)p[3] << 16) | (p[4] << 8) | p[5];
+		cnt = (p[7] << 8) | p[8];
+		if (lba + cnt > d->cd_blocks || cnt * MOCK_CD_BLOCK > ABUF) {
+			atapi_check( d, 5, 0x21);
+			return;
+		}
+		if (d->unc_lba >= 0 && (unsigned long)d->unc_lba >= lba && (unsigned long)d->unc_lba < lba + cnt) {
+			atapi_check( d, 3, 0x11);
+			return;
+		}
+		atapi_data_in( d, d->cd + lba * MOCK_CD_BLOCK, (unsigned)(cnt * MOCK_CD_BLOCK), (unsigned)(cnt * MOCK_CD_BLOCK));
+		return;
+	case 0x5A:				/* MODE SENSE(10): an empty header */
+		memset( r, 0, 8);
+		r[1] = 6;
+		alloc = (p[7] << 8) | p[8];
+		atapi_data_in( d, r, 8, alloc);
+		return;
+	case 0x55:				/* MODE SELECT(10): data out */
+		alloc = (p[7] << 8) | p[8];
+		if (alloc > sizeof mock_atapi_out)
+			alloc = sizeof mock_atapi_out;
+		alen = alloc; apos = 0;
+		mock_atapi_out_n = 0;
+		xmode = 5;
+		atapi_phase( d);
+		return;
+	default:
+		atapi_check( d, 5, 0x20);
+		return;
+	}
+}
+
+/* one 16-bit DATA read in an ATAPI data-in phase */
+static unsigned short
+atapi_rw( d)
+struct mock_drive	*d;
+{
+	unsigned short	w;
+
+	w = (unsigned short)(abuf[apos] << 8);
+	if (aphase >= 2)
+		w |= abuf[apos + 1];
+	if (aphase >= 2) { apos += 2; aphase -= 2; }
+	else             { apos += 1; aphase = 0; }
+	if (aphase == 0)
+		atapi_phase( d);
+	return w;
+}
+
+/* one 16-bit DATA write: the packet, or a data-out phase */
+static void
+atapi_ww( d, v)
+struct mock_drive	*d;
+unsigned short		v;
+{
+	if (xmode == 3) {
+		pktbuf[pidx++] = v >> 8;
+		pktbuf[pidx++] = v & 0xFF;
+		if (pidx >= (d->pkt16 ? 16 : 12)) {
+			r_status[sel] = ST_BSY;
+			atapi_packet( d);
+		}
+		return;
+	}
+	abuf[apos] = v >> 8;
+	if (aphase >= 2)
+		abuf[apos + 1] = v & 0xFF;
+	if (aphase >= 2) { apos += 2; aphase -= 2; }
+	else             { apos += 1; aphase = 0; }
+	if (aphase == 0) {
+		if (apos >= alen) {
+			memcpy( mock_atapi_out, abuf, alen);
+			mock_atapi_out_n = alen;
+		}
+		atapi_phase( d);
+	}
+}
+
+static void
+identify_packet( d)
+struct mock_drive	*d;
+{
+	memset( xbuf, 0, sizeof xbuf);
+	idw( 0, 0x85C0 | (d->pkt16 ? 1 : 0));	/* ATAPI, CD-ROM, removable, 50 us DRQ */
+	idstr( 10, 10, "CD0000000001");
+	idstr( 23, 4, "1.00");
+	idstr( 27, 20, d->model);
+	idw( 49, 0x0200);
+}
+
+static void
+atapi_command( d, cmd)
+struct mock_drive	*d;
+int			cmd;
+{
+	r_error = 0;
+	switch (cmd) {
+	case 0xA1:			/* IDENTIFY PACKET DEVICE */
+		identify_packet( d);
+		xidx = 0; xmode = 1; xleft = 1;
+		xlba = (unsigned long)-1;
+		r_status[sel] = ST_DSC | ST_DRQ;
+		raise_intrq();
+		return;
+	case 0xA0:			/* PACKET */
+		pkt_bc = r_lcyl | (r_hcyl << 8);
+		mock_pkt_bc = pkt_bc;
+		pidx = 0;
+		memset( pktbuf, 0, sizeof pktbuf);
+		xmode = 3;
+		r_nsect = IR_COD;
+		r_status[sel] = ST_DSC | ST_DRQ;	/* no INTRQ: accelerated DRQ */
+		return;
+	default:			/* IDENTIFY DEVICE and every ATA command: abort + signature */
+		r_lcyl = 0x14; r_hcyl = 0xEB;
+		r_error = ER_ABRT;
+		xmode = 0;
+		r_status[sel] = ST_DSC | ST_ERR;
+		raise_intrq();
+		return;
+	}
 }
 
 static void
@@ -245,8 +571,14 @@ int	cmd;
 
 	mock_cmd_count[cmd]++;
 	mock_last_cmd = cmd;
+	if (mock_cmd_log_n < 64)
+		mock_cmd_log[mock_cmd_log_n++] = cmd;
 	if (!d->present)
 		return;
+	if (d->atapi) {
+		atapi_command( d, cmd);
+		return;
+	}
 	r_error = 0;
 	switch (cmd) {
 	case 0xEC:			/* IDENTIFY DEVICE */
@@ -263,6 +595,12 @@ int	cmd;
 		xlba = lba();
 		if (xlba + n > d->nsectors) { fail( ER_IDNF); break; }
 		xleft = n;
+		if (d->hang_on_cmd) {		/* command accepted, then the drive dies */
+			d->hang_on_cmd = 0;
+			d->hung = 1;
+			mock_intrq = 0;
+			break;
+		}
 		if (cmd == 0x20) {
 			xmode = 1;
 			load_sector();
@@ -270,6 +608,18 @@ int	cmd;
 			xmode = 2; xidx = 0;
 			r_status[sel] = ST_DRDY | ST_DSC | ST_DRQ;	/* no INTRQ for the first sector */
 		}
+		break;
+	case 0x40:			/* READ VERIFY SECTOR(S): no data phase */
+		if (!(r_sdh & 0x40)) { fail( ER_ABRT); break; }
+		n = r_nsect ? r_nsect : 256;
+		xlba = lba();
+		if (xlba + n > d->nsectors) { fail( ER_IDNF); break; }
+		if (d->unc_lba >= 0 && (unsigned long)d->unc_lba >= xlba && (unsigned long)d->unc_lba < xlba + n) {
+			fail( ER_UNC);
+			break;
+		}
+		r_status[sel] = ST_DRDY | ST_DSC;
+		raise_intrq();
 		break;
 	case 0xE7:			/* FLUSH CACHE */
 		if (d->flush) {
@@ -293,7 +643,11 @@ status()
 
 	if (!d->present)
 		return sel == 0 ? 0xFF : 0x00;	/* open bus / device 1 absent */
-	if (d->stuck_bsy)
+	if (d->atapi && glitch_left > 0 && mock_nien) {
+		glitch_left--;
+		return 0x00;
+	}
+	if (d->stuck_bsy || d->hung)
 		return ST_BSY;
 	return r_status[sel];
 }
@@ -308,10 +662,16 @@ unsigned char	*vp;
 
 	mock_taskfile_accesses++;
 	switch (off) {
-	case R_STATUS:	*vp = status(); mock_intrq = 0; return 1;
+	case R_STATUS:
+		if (mock_bsy_reads > 0 && d->present) {	/* a drive slow to finish */
+			mock_bsy_reads--;
+			*vp = ST_BSY;
+			return 1;
+		}
+		*vp = status(); mock_intrq = 0; return 1;
 	case R_ALTSTAT:	*vp = status(); return 1;
 	case R_ERROR:	*vp = d->present ? r_error : 0xFF; return 1;
-	case R_NSECT:	*vp = d->present ? r_nsect : 0xFF; return 1;
+	case R_NSECT:	*vp = d->present ? (d->atapi && glitch_left > 0 && mock_nien ? IR_COD : r_nsect) : 0xFF; return 1;
 	case R_SECT:	*vp = d->present ? r_sect  : 0xFF; return 1;
 	case R_LCYL:	*vp = d->present ? r_lcyl  : 0xFF; return 1;
 	case R_HCYL:	*vp = d->present ? r_hcyl  : 0xFF; return 1;
@@ -342,14 +702,50 @@ unsigned char	v;
 	case R_ALTSTAT:					/* CONTROL */
 		r_control = v;
 		mock_nien = (v & 0x02) != 0;
-		if (v & 0x04) {				/* SRST */
+		if (v & 0x04) {				/* SRST: both drives */
+			mock_srst_count++;
 			r_status[0] = r_status[1] = ST_DRDY | ST_DSC;
+			mock_drv[0].hung = mock_drv[1].hung = 0;
+			if (mock_drv[0].atapi) r_status[0] = 0;
+			if (mock_drv[1].atapi) r_status[1] = 0;
+			if (mock_drv[0].atapi || mock_drv[1].atapi) {
+				r_lcyl = 0x14; r_hcyl = 0xEB;
+			}
 			xmode = 0; mock_intrq = 0;
 		}
 		return 1;
 	}
 	return 0;
 }
+
+static void
+data_access()
+{
+	mock_seq++;
+	if (mock_data_first == 0)
+		mock_data_first = mock_seq;
+	mock_data_last = mock_seq;
+}
+
+static void
+lineop( addr, op)
+unsigned long	addr;
+int		op;
+{
+	mock_seq++;
+	if (mock_nlineops >= MOCK_LINEOPS) {
+		mock_lineops_lost++;
+		return;
+	}
+	mock_lineops[mock_nlineops].addr = addr;
+	mock_lineops[mock_nlineops].op   = op;
+	mock_lineops[mock_nlineops].seq  = mock_seq;
+	mock_nlineops++;
+}
+
+void mock_cpushl( addr) unsigned long addr; { lineop( addr, MOCK_CPUSHL); }
+void mock_cinvl( addr) unsigned long addr; { lineop( addr, MOCK_CINVL); }
+void mock_sync() { mock_seq++; wr_pending = 0; }
 
 unsigned char
 mock_rb( addr)
@@ -370,8 +766,12 @@ unsigned long	addr;
 	}
 	if (mock_board == MOCK_BOARD_A4000 && addr == IRQ_A4000)
 		return mock_intrq ? 0x80 : 0x00;
-	if (has_gayle() && addr >= base() && addr < base() + 0x1100 && tf_read( addr - base(), &v))
+	if (has_gayle() && addr >= base() && addr < base() + 0x1100 && tf_read( addr - base(), &v)) {
+		mock_seq++;
+		if (wr_pending)
+			mock_order_violations++;
 		return v;
+	}
 	if ((mock_board == MOCK_BOARD_A1200 || mock_board == MOCK_BOARD_A600)) {
 		if (addr == INTREQ_A1200)
 			return (mock_irq_latch ? 0x80 : 0x00) | 0x00;
@@ -396,8 +796,11 @@ unsigned char	v;
 		id_cnt = 0;
 		return;
 	}
-	if (has_gayle() && addr >= base() && addr < base() + 0x1100 && tf_write( addr - base(), v))
+	if (has_gayle() && addr >= base() && addr < base() + 0x1100 && tf_write( addr - base(), v)) {
+		mock_seq++;
+		wr_pending = 1;
 		return;
+	}
 	if ((mock_board == MOCK_BOARD_A1200 || mock_board == MOCK_BOARD_A600)) {
 		if (addr == INTREQ_A1200) {
 			mock_irq_acks++;
@@ -434,6 +837,11 @@ unsigned long	addr;
 		return 0xFFFF;
 	}
 	mock_taskfile_accesses++;
+	data_access();
+	if (wr_pending)
+		mock_order_violations++;
+	if (xmode == 4 && cur()->present && cur()->atapi)
+		return atapi_rw( cur());
 	if (xmode != 1 || !cur()->present)
 		return xmode == 0 ? 0xFFFF : 0;
 	w = ((unsigned short)xbuf[xidx] << 8) | xbuf[xidx + 1];
@@ -463,6 +871,12 @@ unsigned short	v;
 		return;
 	}
 	mock_taskfile_accesses++;
+	data_access();
+	wr_pending = 1;
+	if ((xmode == 3 || xmode == 5) && d->present && d->atapi) {
+		atapi_ww( d, v);
+		return;
+	}
 	if (xmode != 2 || !d->present)
 		return;
 	xbuf[xidx]     = v >> 8;
