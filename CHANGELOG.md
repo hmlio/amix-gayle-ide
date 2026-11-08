@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-11-08
+
+- **PRs #2–#7 merged** (Jusii, tested on an A4000 with a Z3660 in 68060 mode).
+  - **Probe (#2):** automatic detection is A4000-only; the Gayle ID register `0xDE1000` is read only when
+    `ide_board_force` selects the A1200 (2) or A600 (3). An empty port no longer spins the reset budget.
+  - **Request queue (#3):** duplicate submits of an active `sdcom` are ignored; SYNCHRONIZE CACHE is queued
+    behind transfers in interrupt mode; a timed-out command resets the drive (SRST).
+  - **SCSI command fixes (#4):** VERIFY(10) runs READ VERIFY SECTOR(S); DF is a hardware error; LBA range
+    check no longer wraps; LUN ≠ 0 rejected; a full completion FIFO delivers instead of dropping.
+  - **Docs (#5):** README and design record aligned with the driver; VPOSR id 0x23 confirmed on a real PAL A4000.
+  - **68040/68060 build (#6):** `-DIDE_CACHE=1 -DIDE_NBPP=4096` adds cache push/invalidate around PIO and a
+    DTT check of the register window; that line is polled only.
+  - **ATAPI CD-ROM (#7):** PACKET passthrough; `ide_slave_enable 2` attaches the slave only if it is ATAPI.
+- `docs/interfaces.md` added: what other drivers may rely on (units, board table, Gayle INTREQ/INTENA sharing
+  rules on the A1200/A600, tunables and counters).
+- Host harness: the `printf` stub in `test/host/kstubs.c` is now non-variadic, matching the driver's
+  `extern int printf();`; on arm64 (Apple Silicon) the variadic stub read garbage and crashed.
+
+## 2026-10-13
+
+- **`support.c.patch` dropped** (PR #1, Jusii). The phantom-A3000-SCSI removal now comes only from
+  `amix-a4091`, which the amix-kerntools hub applies to every kernel; building by hand needs that
+  copy. `kernel.c.patch` hunk header regenerated (applies at zero fuzz, content unchanged).
+- Open: `amix-a4091`'s copy still uses the `& 0x7F) < 0x22` AGA test, which misclassifies NTSC ECS
+  (`docs/vposr-aga-gate.md`). A4000 is unaffected; reported to the maintainer.
+
 ## 2026-09-28
 
 - **First release.** License: MIT (`LICENSE`). Repository shaped after the

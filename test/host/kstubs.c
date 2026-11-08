@@ -3,9 +3,11 @@
  * the spl bracket (counted), timeout() (recorded, fired by the test) and a
  * printf that records what the driver would have put on the console.
  */
-#include <stdio.h>
-#include <stdarg.h>
+#include <stddef.h>
 #include <string.h>
+
+/* No <stdio.h>: it would prototype printf() as variadic (see below). */
+extern int	snprintf( char *, size_t, const char *, ...);
 
 int	mock_ipl;
 long	mock_spl_calls, mock_splx_calls;
@@ -44,18 +46,21 @@ mock_console_reset()
 }
 
 /* Overrides the C library's printf for the whole executable (the harness
- * reports through fprintf(stdout/stderr)). */
+ * reports through fprintf(stdout/stderr)).  Defined K&R-style with fixed
+ * slots, not variadic: the driver calls it through `extern int printf();`,
+ * i.e. with the non-variadic convention, which on arm64 differs from the
+ * variadic one.  Every slot is register/stack-word sized, so the driver's
+ * int and pointer arguments (%d/%x/%s, at most 7) arrive intact. */
+#undef printf
 int
-printf( const char *fmt, ...)
+printf( fmt, a1, a2, a3, a4, a5, a6, a7)
+const char	*fmt;
+long	a1, a2, a3, a4, a5, a6, a7;
 {
-	va_list	ap;
 	size_t	used = strlen( mock_console);
-	int	n;
 
-	va_start( ap, fmt);
-	n = vsnprintf( mock_console + used, sizeof mock_console - used, fmt, ap);
-	va_end( ap);
-	return n;
+	return snprintf( mock_console + used, sizeof mock_console - used, fmt,
+	    a1, a2, a3, a4, a5, a6, a7);
 }
 
 /*
