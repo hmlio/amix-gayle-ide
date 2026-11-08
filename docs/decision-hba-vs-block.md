@@ -13,8 +13,11 @@ below are interface facts also documented publicly by the upstream projects.
 2. **Registration of a fixed-address controller is a solved problem.** `amix-kerntools` generates the
    host-adapter table from `driver.conf` and supports a `probe=` function for boards that are not
    AutoConfig (used by the Z3660 SCSI driver). The upstream A4091 `support.c` patch removes the
-   "phantom A3000 SCSI" on AGA machines, so on an A4000 the IDE controller becomes **card 0** and the
-   IDE master is `c0d0` — a root-device configuration (`c0s1unix`) that the stock tree already ships.
+   "phantom A3000 SCSI" on AGA machines, so on an A4000 the IDE controller becomes **card 0**. The
+   driver presents the master as **SCSI unit 6** (`ide_master_unit`), so it answers `c6d0` and the
+   stock `c6d0s1` root configuration, `vfstab` and the installer's defaults apply unchanged. (This
+   record originally foresaw `c0d0` / `c0s1unix`; unit 6 was chosen during implementation so that an
+   image installed on an A3000 boots as is.)
 3. **Interrupt and memory primitives exist and are simple.** Level-2 handlers are called from a
    NULL-terminated table for every INT2 (the dispatcher clears the PORTS bit, handlers check their own
    device). Kernel virtual == physical for RAM, so a PIO driver copies straight to/from the physical
@@ -35,10 +38,13 @@ no performance argument either: both paths end in PIO word copies.
   split as needed); REQUEST SENSE → synthesised sense from the last ATA error; INQUIRY, TEST UNIT READY,
   READ CAPACITY(10), MODE SENSE(6), START/STOP, SYNCHRONIZE CACHE answered locally (needed by the
   `GSIO` passthrough used by userland tools); everything else → CHECK CONDITION / ILLEGAL REQUEST.
-- Units: unit 0 = master, unit 1 = slave (slave disabled by default — FlashAir safety rule).
-- Completion model: start with synchronous polled completion inside `idequeue` (like the Z3660 driver);
-  move to INT2-driven completion in Phase 2.
-- Multi-page requests: same physical-contiguity assumption as the stock DMA host adapters; add a
-  `cmn_err` guard if a request crosses a 2048-byte page in a way we cannot serve.
+- Units: the master is SCSI unit 6 (`ide_master_unit`), the slave unit 5 (`ide_slave_unit`, disabled
+  by default — FlashAir safety rule); drive index 0/1 inside the driver.
+- Completion model: synchronous polled completion inside `idequeue` first (like the Z3660 driver),
+  INT2-driven completion in Phase 2 (done). SYNCHRONIZE CACHE and VERIFY(10) take the same queue as
+  READ/WRITE in interrupt mode, so no command is ever issued over a transfer in flight.
+- Multi-page requests: same physical-contiguity assumption as the stock DMA host adapters. A raw
+  request (one page or less) that crosses a page boundary is the case this cannot guarantee;
+  `ide_pagecross_n` counts them and the first is logged (`IDE_NBPP`, 2048 on the 030 kernel).
 - Probe safety: gate on the AGA chipset (VPOSR) before touching 0xDD2020, then a register readback
   test; never register on an A3000.
