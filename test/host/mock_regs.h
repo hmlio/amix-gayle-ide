@@ -10,4 +10,11 @@ extern void           mock_ww();
 #define WB( a, v)	mock_wb( (unsigned long)(a), (unsigned char)(v))
 #define RW( a)		mock_rw( (unsigned long)(a))
 #define WW( a, v)	mock_ww( (unsigned long)(a), (unsigned short)(v))
+#if IDE_CACHE
+extern void           mock_cpushl(), mock_cinvl(), mock_sync();
+extern unsigned long  mock_dtt0, mock_dtt1, mock_cacr;
+#define IDE_CPUSHL( p)	mock_cpushl( (unsigned long)(p))
+#define IDE_CINVL( p)	mock_cinvl( (unsigned long)(p))
+#define IDE_SYNC()	mock_sync()
+#endif
 #endif

@@ -49,6 +49,21 @@ int			mock_cmd_log_n;
 int			mock_nien, mock_intrq, mock_irq_latch;
 unsigned char		mock_intena;
 
+/* CPU-side model for the IDE_CACHE build: an access sequence number, the
+ * span of DATA-register accesses, task-file reads that could overtake an
+ * unsynchronised write, and a log of data-cache line operations. */
+unsigned long		mock_bsy_reads;		/* STATUS reads that still show BSY */
+unsigned long		mock_seq;
+unsigned long		mock_data_first, mock_data_last;	/* seq of DATA accesses, 0 = none */
+unsigned long		mock_order_violations;
+static int		wr_pending;
+unsigned long		mock_dtt0 = 0x003fc060L;	/* pstart040.s */
+unsigned long		mock_dtt1 = 0x807fa060L;
+unsigned long		mock_cacr = 0x80008000L;
+struct mock_lineop	mock_lineops[MOCK_LINEOPS];
+int			mock_nlineops;
+unsigned long		mock_lineops_lost;
+
 /* task file (shared by both drives, as on the real cable) */
 static unsigned char	r_nsect, r_sect, r_lcyl, r_hcyl, r_sdh, r_error, r_control;
 static unsigned char	r_status[2];
@@ -81,6 +96,15 @@ has_gayle()
 void
 mock_reset()
 {
+	mock_bsy_reads = 0;
+	mock_data_first = mock_data_last = 0;
+	mock_order_violations = 0;
+	wr_pending = 0;
+	mock_nlineops = 0;
+	mock_lineops_lost = 0;
+	mock_dtt0 = 0x003fc060L;
+	mock_dtt1 = 0x807fa060L;
+	mock_cacr = 0x80008000L;
 	memset( mock_cmd_count, 0, sizeof mock_cmd_count);
 	mock_accesses = mock_bad_accesses = mock_taskfile_accesses = mock_slave_selects = 0;
 	mock_irq_acks = mock_id_reads = 0;
@@ -339,7 +363,13 @@ unsigned char	*vp;
 
 	mock_taskfile_accesses++;
 	switch (off) {
-	case R_STATUS:	*vp = status(); mock_intrq = 0; return 1;
+	case R_STATUS:
+		if (mock_bsy_reads > 0 && d->present) {	/* a drive slow to finish */
+			mock_bsy_reads--;
+			*vp = ST_BSY;
+			return 1;
+		}
+		*vp = status(); mock_intrq = 0; return 1;
 	case R_ALTSTAT:	*vp = status(); return 1;
 	case R_ERROR:	*vp = d->present ? r_error : 0xFF; return 1;
 	case R_NSECT:	*vp = d->present ? r_nsect : 0xFF; return 1;
@@ -384,6 +414,35 @@ unsigned char	v;
 	return 0;
 }
 
+static void
+data_access()
+{
+	mock_seq++;
+	if (mock_data_first == 0)
+		mock_data_first = mock_seq;
+	mock_data_last = mock_seq;
+}
+
+static void
+lineop( addr, op)
+unsigned long	addr;
+int		op;
+{
+	mock_seq++;
+	if (mock_nlineops >= MOCK_LINEOPS) {
+		mock_lineops_lost++;
+		return;
+	}
+	mock_lineops[mock_nlineops].addr = addr;
+	mock_lineops[mock_nlineops].op   = op;
+	mock_lineops[mock_nlineops].seq  = mock_seq;
+	mock_nlineops++;
+}
+
+void mock_cpushl( addr) unsigned long addr; { lineop( addr, MOCK_CPUSHL); }
+void mock_cinvl( addr) unsigned long addr; { lineop( addr, MOCK_CINVL); }
+void mock_sync() { mock_seq++; wr_pending = 0; }
+
 unsigned char
 mock_rb( addr)
 unsigned long	addr;
@@ -403,8 +462,12 @@ unsigned long	addr;
 	}
 	if (mock_board == MOCK_BOARD_A4000 && addr == IRQ_A4000)
 		return mock_intrq ? 0x80 : 0x00;
-	if (has_gayle() && addr >= base() && addr < base() + 0x1100 && tf_read( addr - base(), &v))
+	if (has_gayle() && addr >= base() && addr < base() + 0x1100 && tf_read( addr - base(), &v)) {
+		mock_seq++;
+		if (wr_pending)
+			mock_order_violations++;
 		return v;
+	}
 	if ((mock_board == MOCK_BOARD_A1200 || mock_board == MOCK_BOARD_A600)) {
 		if (addr == INTREQ_A1200)
 			return (mock_irq_latch ? 0x80 : 0x00) | 0x00;
@@ -429,8 +492,11 @@ unsigned char	v;
 		id_cnt = 0;
 		return;
 	}
-	if (has_gayle() && addr >= base() && addr < base() + 0x1100 && tf_write( addr - base(), v))
+	if (has_gayle() && addr >= base() && addr < base() + 0x1100 && tf_write( addr - base(), v)) {
+		mock_seq++;
+		wr_pending = 1;
 		return;
+	}
 	if ((mock_board == MOCK_BOARD_A1200 || mock_board == MOCK_BOARD_A600)) {
 		if (addr == INTREQ_A1200) {
 			mock_irq_acks++;
@@ -467,6 +533,9 @@ unsigned long	addr;
 		return 0xFFFF;
 	}
 	mock_taskfile_accesses++;
+	data_access();
+	if (wr_pending)
+		mock_order_violations++;
 	if (xmode != 1 || !cur()->present)
 		return xmode == 0 ? 0xFFFF : 0;
 	w = ((unsigned short)xbuf[xidx] << 8) | xbuf[xidx + 1];
@@ -496,6 +565,8 @@ unsigned short	v;
 		return;
 	}
 	mock_taskfile_accesses++;
+	data_access();
+	wr_pending = 1;
 	if (xmode != 2 || !d->present)
 		return;
 	xbuf[xidx]     = v >> 8;

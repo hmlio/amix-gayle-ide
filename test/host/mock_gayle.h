@@ -61,6 +61,22 @@ extern unsigned long		mock_irq_acks;		/* acknowledge writes seen */
 extern unsigned long		mock_id_reads;		/* Gayle ID register reads */
 extern unsigned long		mock_srst_count;	/* software resets seen (SRST set) */
 
+/* CPU-side model (IDE_CACHE build): see mock_gayle.c */
+#define MOCK_LINEOPS	8192
+#define MOCK_CPUSHL	1
+#define MOCK_CINVL	2
+struct mock_lineop {
+	unsigned long	addr, seq;
+	int		op;
+};
+extern unsigned long		mock_bsy_reads;		/* next STATUS reads that show BSY */
+extern unsigned long		mock_seq, mock_data_first, mock_data_last;
+extern unsigned long		mock_order_violations;	/* task-file read with a write not yet synced */
+extern unsigned long		mock_dtt0, mock_dtt1, mock_cacr;
+extern struct mock_lineop	mock_lineops[MOCK_LINEOPS];
+extern int			mock_nlineops;
+extern unsigned long		mock_lineops_lost;
+
 void mock_reset();
 void mock_add_drive();			/* (unit, nsectors, model, flush) */
 void mock_free();

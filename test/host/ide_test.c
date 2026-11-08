@@ -28,6 +28,17 @@ extern unsigned long	ide_intr_count, ide_intr_spurious, ide_intr_timeouts, ide_t
 extern unsigned long	ide_dup_submits, ide_resets, ide_pagecross_n, ide_intr_busy;
 extern int	ide_slave_enable, ide_debug, ide_master_unit, ide_slave_unit;
 extern int	ide_intr_enable, ide_board_force;
+extern unsigned long	ide_spins_hw;
+#if IDE_CACHE
+extern long	ide_cache;
+extern unsigned long	ide_push_n, ide_ci_ok;
+#endif
+
+/* page size the driver was built for (the 68040/68060 line uses 4096) */
+#ifndef IDE_NBPP
+#define IDE_NBPP	2048
+#endif
+#define PG	IDE_NBPP
 
 /* the kernel's level-2 table (master.d/kernel.c); mutable here so a test can
  * remove the hook and exercise the polled fallback */
@@ -119,6 +130,9 @@ unsigned	nbyte;
 	pump();
 	CHECK( intr_calls == 1, "completion delivered exactly once");
 	CHECK( intr_last == cp, "completion carries the request");
+#if IDE_CACHE
+	CHECK( mock_order_violations == 0, "no task-file read ahead of an unsynchronised write");
+#endif
 }
 
 static void
@@ -881,23 +895,23 @@ static void
 test_pagecross_counter()
 {
 	struct sdcom	cp;
-	static char	big[6 * 2048];
+	static char	big[6 * PG];
 	char		*p;
 
 	fresh( 1);
 	tur( &cp, 6);
-	p = big + (2048 - ((unsigned long)big & 2047)) % 2048;	/* first page-aligned byte */
+	p = big + (PG - ((unsigned long)big & (PG - 1))) % PG;	/* first page-aligned byte */
 	read10( &cp, 6, 10L, 2, p, 1024);
 	CHECK( cp.okay && cp.status == 0 && ide_pagecross_n == 0, "aligned 1 KB request: not counted");
-	read10( &cp, 6, 12L, 1, p + 2048 - 256, 512);
-	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 12L, p + 2048 - 256, 512), "straddling request still served");
+	read10( &cp, 6, 12L, 1, p + PG - 256, 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 12L, p + PG - 256, 512), "straddling request still served");
 	CHECK( ide_pagecross_n == 1, "512 B request straddling a page boundary: counted");
 	CHECK( strstr( mock_console, "crosses a page boundary") != 0, "first crossing logged");
-	read10( &cp, 6, 14L, 4, p + 2048 - 512, 2048);
-	CHECK( ide_pagecross_n == 2, "2 KB request straddling a page boundary: counted");
-	read10( &cp, 6, 20L, 16, p, 8192);
-	CHECK( cp.okay && cp.status == 0 && ide_pagecross_n == 2, "8 KB buffer-cache block: spans pages by nature, not counted");
-	read10( &cp, 6, 40L, 4, p + 2048, 2048);
+	read10( &cp, 6, 14L, PG / 512, p + PG - 512, PG);
+	CHECK( ide_pagecross_n == 2, "one-page request straddling a page boundary: counted");
+	read10( &cp, 6, 20L, 4 * PG / 512, p, 4 * PG);
+	CHECK( cp.okay && cp.status == 0 && ide_pagecross_n == 2, "multi-page buffer-cache block: spans pages by nature, not counted");
+	read10( &cp, 6, 40L, PG / 512, p + PG, PG);
 	CHECK( ide_pagecross_n == 2, "page-aligned full page: not counted");
 }
 
@@ -1231,9 +1245,217 @@ test_intr_not_mine()
 	CHECK( ide_intr_count == 0 && ide_intr_spurious == 0, "not-mine interrupt not counted");
 }
 
+/* the spin budgets' high-water mark records what a successful wait needed */
+static void
+test_spins_hw()
+{
+	struct sdcom	cp;
+	static char	buf[512];
+
+	fresh( 1);
+	tur( &cp, 6);
+	ide_spins_hw = 0;
+	mock_bsy_reads = 50;
+	read10( &cp, 6, 3L, 1, buf, sizeof buf);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 3L, buf, sizeof buf), "read behind a slow BSY served");
+	CHECK( ide_spins_hw == 50, "high-water = the BSY reads the wait sat through");
+	mock_bsy_reads = 10;
+	read10( &cp, 6, 4L, 1, buf, sizeof buf);
+	CHECK( ide_spins_hw == 50, "a shorter wait leaves the high-water alone");
+}
+
+/* the attach banner's MB figure (computed without a shift by 11) */
+static void
+test_banner_mb()
+{
+	struct sdcom	cp;
+
+	fresh( 1);
+	tur( &cp, 6);
+	CHECK( strstr( mock_console, "4096 sectors (2 MB)") != 0, "banner: 4096 sectors = 2 MB");
+}
+
+#if IDE_CACHE
+/*
+ * Every 16-byte line covering [lo, lo + len) saw a CPUSHL and then a CINVL,
+ * both with a sequence number in (after, before).
+ */
+static int
+lines_done( lo, len, after, before)
+unsigned long	lo, len, after, before;
+{
+	unsigned long	a;
+	int		i, pushed, ok;
+
+	for (a = lo & ~15UL; a < ((lo + len + 15) & ~15UL); a += 16) {
+		ok = pushed = 0;
+		for (i = 0; i < mock_nlineops && !ok; ++i) {
+			if (mock_lineops[i].addr != a || mock_lineops[i].seq <= after
+			    || mock_lineops[i].seq >= before)
+				continue;
+			if (mock_lineops[i].op == MOCK_CPUSHL)
+				pushed = 1;
+			else if (pushed)
+				ok = 1;
+		}
+		if (!ok)
+			return 0;
+	}
+	return 1;
+}
+
+/* No line operation outside the rounded range. */
+static int
+lines_only( lo, len)
+unsigned long	lo, len;
+{
+	int	i;
+
+	for (i = 0; i < mock_nlineops; ++i)
+		if (mock_lineops[i].addr < (lo & ~15UL)
+		    || mock_lineops[i].addr >= ((lo + len + 15) & ~15UL)
+		    || (mock_lineops[i].addr & 15))
+			return 0;
+	return mock_lineops_lost == 0;
+}
+
+static void
+test_cache_spin_scale()
+{
+	/* before any fresh(): the compiled-in defaults */
+	CHECK( ide_spins == 8000000UL && ide_spins_reset == 32000000UL && ide_spins_short == 800000UL,
+	       "040/060 build scales the spin budgets by 4");
+}
+
+static void
+test_cache_ci_check()
+{
+	struct sdcom	cp;
+
+	fresh( 1);
+	tur( &cp, 6);
+	CHECK( ide_ci_ok == 1, "shipped DTT0 covers the task file cache-inhibited");
+	CHECK( strstr( mock_console, "NOT cache-inhibited") == 0, "no warning on the shipped TTRs");
+
+	fresh( 1);
+	mock_dtt0 = 0x003fc020L;			/* same window, copyback */
+	tur( &cp, 6);
+	CHECK( ide_ci_ok == 2, "a cached DTT0 fails the check");
+	CHECK( strstr( mock_console, "NOT cache-inhibited") != 0, "and says so");
+	CHECK( cp.okay && cp.status == 0, "the driver carries on");
+
+	fresh( 1);
+	mock_dtt0 = 0;					/* disabled; DTT1 covers 0x80.. only */
+	tur( &cp, 6);
+	CHECK( ide_ci_ok == 2, "an address no TTR covers fails the check");
+
+	fresh( 1);
+	mock_dtt0 = 0x003f8060L;			/* user-only TTR */
+	tur( &cp, 6);
+	CHECK( ide_ci_ok == 2, "a user-only TTR does not cover supervisor data");
+
+	fresh( 1);
+	mock_dtt0 = 0x003fc040L;			/* cache-inhibited, serialized */
+	tur( &cp, 6);
+	CHECK( ide_ci_ok == 1, "CI-serialized passes");
+}
+
+/* READ: lines pushed before the first DATA access and again after the last */
+static void
+cache_read_case( polled)
+int	polled;
+{
+	struct sdcom	cp;
+	static char	buf[4 * 512 + 64];
+	char		*p = buf + 5;			/* unaligned both ends */
+	unsigned long	n0;
+
+	fresh( 1);
+	if (polled)
+		int2_tbl[0] = 0;
+	tur( &cp, 6);
+	mock_nlineops = 0;
+	mock_data_first = mock_data_last = 0;
+	n0 = ide_push_n;
+	read10( &cp, 6, 50L, 3, p, 3 * 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 50L, p, 3 * 512), "cache build: read data intact");
+	CHECK( lines_done( (unsigned long)p, 3 * 512UL, 0UL, mock_data_first), "read: every line pushed+invalidated before the transfer");
+	CHECK( lines_done( (unsigned long)p, 3 * 512UL, mock_data_last, ~0UL), "read: and again after it");
+	CHECK( lines_only( (unsigned long)p, 3 * 512UL), "read: no line outside the buffer's range");
+	CHECK( ide_push_n - n0 == 2, "read: two passes");
+}
+
+static void
+test_cache_read()
+{
+	cache_read_case( 0);
+	cache_read_case( 1);
+}
+
+/* WRITE: lines pushed before the first DATA access; nothing after */
+static void
+cache_write_case( polled)
+int	polled;
+{
+	struct sdcom	cp;
+	static char	buf[2 * 512 + 32];
+	char		*p = buf + 7;
+	unsigned long	n0;
+	int		i;
+
+	fresh( 1);
+	if (polled)
+		int2_tbl[0] = 0;
+	tur( &cp, 6);
+	for (i = 0; i < 2 * 512; ++i)
+		p[i] = (char)(i * 7 + polled);
+	mock_nlineops = 0;
+	mock_data_first = mock_data_last = 0;
+	n0 = ide_push_n;
+	write10( &cp, 6, 60L, 2, p, 2 * 512);
+	CHECK( cp.okay && cp.status == 0 && disk_equals( 0, 60L, p, 2 * 512), "cache build: write landed");
+	CHECK( lines_done( (unsigned long)p, 2 * 512UL, 0UL, mock_data_first), "write: every line pushed+invalidated before the transfer");
+	CHECK( lines_only( (unsigned long)p, 2 * 512UL), "write: no line outside the buffer's range");
+	CHECK( ide_push_n - n0 == 1, "write: one pass");
+}
+
+static void
+test_cache_write()
+{
+	cache_write_case( 0);
+	cache_write_case( 1);
+}
+
+/* synthesised data (INQUIRY) is covered too; ide_cache = 0 turns it all off */
+static void
+test_cache_synth_and_off()
+{
+	struct sdcom	cp;
+	static char	buf[512];
+	unsigned char	inq[6] = { 0x12, 0, 0, 0, 36, 0 };
+
+	fresh( 1);
+	tur( &cp, 6);
+	mock_nlineops = 0;
+	run( &cp, 6, inq, 6, buf + 3, 36);
+	CHECK( lines_done( (unsigned long)(buf + 3), 36UL, 0UL, ~0UL), "INQUIRY buffer pushed+invalidated");
+	CHECK( lines_only( (unsigned long)(buf + 3), 36UL), "INQUIRY: only its lines");
+
+	ide_cache = 0;
+	mock_nlineops = 0;
+	read10( &cp, 6, 70L, 1, buf, 512);
+	CHECK( cp.okay && cp.status == 0 && mock_nlineops == 0, "ide_cache = 0: no line operations");
+	tur( &cp, 6);
+	ide_cache = 1;
+}
+#endif	/* IDE_CACHE */
+
 int
 main()
 {
+#if IDE_CACHE
+	fprintf( stderr, "== test_cache_spin_scale\n"); test_cache_spin_scale();
+#endif
 	fprintf( stderr, "== test_probe_no_gayle\n"); test_probe_no_gayle();
 	fprintf( stderr, "== test_probe_chipset_ids\n"); test_probe_chipset_ids();
 	fprintf( stderr, "== test_probe_a4000\n"); test_probe_a4000();
@@ -1265,7 +1487,19 @@ main()
 	fprintf( stderr, "== test_persistent_sdcom_resubmit\n"); test_persistent_sdcom_resubmit();
 	fprintf( stderr, "== test_reentrant_completion\n"); test_reentrant_completion();
 	fprintf( stderr, "== test_intr_not_mine\n"); test_intr_not_mine();
+	fprintf( stderr, "== test_spins_hw\n"); test_spins_hw();
+	fprintf( stderr, "== test_banner_mb\n"); test_banner_mb();
+#if IDE_CACHE
+	fprintf( stderr, "== test_cache_ci_check\n"); test_cache_ci_check();
+	fprintf( stderr, "== test_cache_read\n"); test_cache_read();
+	fprintf( stderr, "== test_cache_write\n"); test_cache_write();
+	fprintf( stderr, "== test_cache_synth_and_off\n"); test_cache_synth_and_off();
+#endif
 	mock_free();
+#if IDE_CACHE
+	fprintf( stdout, "ide_test (040/060: IDE_CACHE, IDE_NBPP %d): %d checks, %d failures\n", PG, checks, failures);
+#else
 	fprintf( stdout, "ide_test: %d checks, %d failures\n", checks, failures);
+#endif
 	return failures ? 1 : 0;
 }
